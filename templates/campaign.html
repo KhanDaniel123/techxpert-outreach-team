@@ -56,7 +56,7 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <div><input name="phone" placeholder="Phone"></div>
 <div><input name="personalized_line" placeholder="Personalized line (optional)"></div>
 <div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
-<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Form?</th><th>Sequence</th>{% if campaign.autopilot %}<th>AI email</th>{% endif %}<th>Notes</th></tr>
+<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Quality</th><th>Fit</th><th>Form?</th><th>Sequence</th>{% if campaign.autopilot %}<th>AI email</th>{% endif %}<th>Notes</th></tr>
 {% for l in leads %}<tr>
 <td><form method="post" action="/campaign/{{ campaign.id }}/toggle_lead">
 <input type="hidden" name="lead_id" value="{{ l.id }}">
@@ -65,11 +65,15 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <td>{% if l.website %}<a href="{{ l.website }}" target="_blank">site</a>{% endif %}</td>
 <td class="mono">{{ l.email }}</td>
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
+<td><small>{% if l.email and l.email_verdict=='valid' %}<span class="pill ok">Email verified</span>{% elif l.email and l.email_verdict=='risky' %}<span class="pill mut" title="Catch-all server, the mailbox itself could not be confirmed">Email risky</span>{% elif l.email %}<span class="pill bad">Email not verified</span>{% else %}<span class="pill mut">No email</span>{% endif %}
+{% if l.website %}<span class="pill ok">Site found</span>{% else %}<span class="pill mut">No site</span>{% endif %}
+{% if l.address %}<span class="pill ok">Address found</span>{% else %}<span class="pill mut">No address</span>{% endif %}</small></td>
+<td>{% if l.fit=='possible_chain' %}<span class="pill bad" title="Chain or franchise signals found. The ICP is independent gyms, so review before contacting.">Possible chain</span>{% elif l.fit=='independent' %}<span class="pill ok" title="No chain or franchise signals found">Independent</span>{% else %}<span class="pill mut">-</span>{% endif %}</td>
 <td>{{ 'yes' if l.has_contact_form else '' }}</td>
 <td><span class="pill {{ seq.get(l.id, ('-', 'mut'))[1] }}">{{ seq.get(l.id, ('-', 'mut'))[0] }}</span></td>
 {% if campaign.autopilot %}<td>{% if l.ai_status == 'ready' %}<span class="pill ok">AI written</span>{% elif l.ai_status == 'pending' %}<span class="pill mut">Writing...</span>{% elif l.ai_status == 'skipped' %}<span class="pill mut" title="{{ l.ai_note }}">Uses template</span>{% elif l.ai_status == 'error' %}<span class="pill bad" title="{{ l.ai_note }}">AI failed</span>{% else %}<span class="pill mut">-</span>{% endif %}</td>{% endif %}
 <td><small>{{ l.notes }}</small>{% if l.personalized_line %}<br><small style="color:#9bd8ff">{{ l.personalized_line }}</small>{% endif %}</td></tr>
-{% else %}<tr><td colspan="{{ 10 if campaign.autopilot else 9 }}"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
+{% else %}<tr><td colspan="{{ 12 if campaign.autopilot else 11 }}"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
 
 <div class="card"><h2>Message template</h2>
 <form method="post" action="/campaign/{{ campaign.id }}/template">
@@ -156,6 +160,7 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <p>{% for s,c in qstat.items() %}<span class="pill mut">{{ s }}: {{ c }}</span> {% endfor %}{% if not qstat %}<small>Queue empty.</small>{% endif %}</p>
 <div class="actions">
 <form method="post" action="/campaign/{{ campaign.id }}/enqueue"><button type="submit">Queue selected leads &amp; start sending</button></form>
+<p><small class="mut">Only leads with a verified email can be queued. Imported lists need "Validate emails" first.</small></p>
 {% if campaign.status == 'stopped' %}
 <form method="post" action="/campaign/{{ campaign.id }}/resume"><button type="submit">Resume</button></form>
 {% else %}

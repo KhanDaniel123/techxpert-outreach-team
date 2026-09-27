@@ -84,11 +84,13 @@ def make_campaign(client, name="Camp", dry_run=1):
     return int(m.group(1))
 
 
-def add_lead(cid, uid, email, name="Biz"):
+def add_lead(cid, uid, email, name="Biz", verdict="valid"):
+    # Test leads are pre-validated by default; the verdict gate itself is
+    # tested separately below (unvalidated leads must never queue or send).
     return db.w("""INSERT INTO leads (user_id, campaign_id, business_name, address,
-        phone, website, email, category, source, notes, selected, created_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-        (uid, cid, name, "", "", "", email, "plumber", "csv", "", 1, time.time()))
+        phone, website, email, email_verdict, category, source, notes, selected, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (uid, cid, name, "", "", "", email, verdict, "plumber", "csv", "", 1, time.time()))
 
 
 def wake(cid):
@@ -487,10 +489,10 @@ if not camp_pl:
                   (u_pl["id"], "PL Test", time.time()))
 else:
     cid_pl = camp_pl["id"]
-n, errs = leadsmod.import_csv(u_pl["id"], cid_pl, _io.BytesIO(
+n, merged, errs = leadsmod.import_csv(u_pl["id"], cid_pl, _io.BytesIO(
     b"business_name,email,personalized_line\nAcme Co,a@acme.com,saw your new trucks on the road\nNoLine Co,b@noline.com,\n"))
 row_pl = db.q("SELECT * FROM leads WHERE campaign_id=? ORDER BY id", (cid_pl,))
-check("csv imports personalized_line", n == 2 and not errs and
+check("csv imports personalized_line", n == 2 and merged == 0 and not errs and
       row_pl[0]["personalized_line"] == "saw your new trucks on the road" and
       row_pl[1]["personalized_line"] == "", str(errs))
 # render from a real DB row (SELECT * shape)
@@ -1120,7 +1122,7 @@ check("enrich completes without retrying none leads",
 
 # --- validate stage (mocked) ---
 lid_good = got[0]["id"]
-lid_bad = add_lead(campP, ua["id"], "bad@invalid.example", "Bad Biz")
+lid_bad = add_lead(campP, ua["id"], "bad@invalid.example", "Bad Biz", verdict="")
 
 
 def fake_validate(emails, max_workers=5):
@@ -1688,6 +1690,180 @@ check("ai test renders draft",
       and b"no booking page" in r.data)
 check("ai test never reveals key",
       b"GEMINI_API_KEY" not in r.data and b"sk-" not in r.data)
+
+
+# ================= 23. data quality: verification gate, dedup, enrichment, fit =================
+import lead_quality as lqmod
+
+uq = make_user("uq@example.com")
+cq = login_client("uq@example.com")
+add_account(uq["id"], "uq@gmail.com")  # dry-run still needs an eligible account
+
+# --- what "validated" means: only valid/risky may enter the send queue ---
+check("only valid/risky verdicts are queueable",
+      lqmod.is_queueable_verdict("valid") and lqmod.is_queueable_verdict("risky")
+      and lqmod.is_queueable_verdict("RISKY"))
+check("invalid/unknown/empty/none verdicts are not queueable",
+      not any(lqmod.is_queueable_verdict(v)
+              for v in ("invalid", "unknown", "", "none", None)))
+
+# --- the enqueue gate: unvalidated leads never queue ---
+c_gate = make_campaign(cq, "GateCamp")
+g_valid = add_lead(c_gate, uq["id"], "g_valid@example.com", "Valid Biz", verdict="valid")
+g_risky = add_lead(c_gate, uq["id"], "g_risky@example.com", "Risky Biz", verdict="risky")
+add_lead(c_gate, uq["id"], "g_none@example.com", "NoVerdict Biz", verdict="")
+add_lead(c_gate, uq["id"], "g_invalid@example.com", "Invalid Biz", verdict="invalid")
+add_lead(c_gate, uq["id"], "g_unknown@example.com", "Unknown Biz", verdict="unknown")
+n = queue_worker.enqueue_campaign(uq["id"], c_gate)
+queued = {x["lead_id"] for x in
+          db.q("SELECT lead_id FROM send_queue WHERE campaign_id=?", (c_gate,))}
+check("enqueue queues only valid/risky leads",
+      n == 2 and queued == {g_valid, g_risky}, f"queued={queued}")
+
+# --- the send-time gate: a verdict that went bad after queueing never sends ---
+db.w("UPDATE leads SET email_verdict='invalid' WHERE id=?", (g_valid,))
+queue_worker.process_sends()
+qitem = db.q("SELECT status, last_error FROM send_queue WHERE campaign_id=? AND lead_id=?",
+             (c_gate, g_valid), one=True)
+check("send-time gate drops the invalidated lead, still-valid lead dry-runs",
+      qitem["status"] == "failed" and "not validated" in (qitem["last_error"] or "")
+      and db.q("SELECT COUNT(*) c FROM send_log WHERE campaign_id=? AND lead_id=?",
+               (c_gate, g_valid), one=True)["c"] == 0
+      and db.q("SELECT COUNT(*) c FROM send_log WHERE campaign_id=? AND lead_id=? AND status='dry-run'",
+               (c_gate, g_risky), one=True)["c"] == 1)
+
+# --- dedup: normalization folds case, suffixes, umlauts, www, schemes, paths ---
+check("name normalization",
+      lqmod.normalize_name("McFIT Berlin Mitte GmbH") == lqmod.normalize_name("mcfit berlin mitte")
+      and lqmod.normalize_name("FitX Hamburg UG") == lqmod.normalize_name("fitx hamburg")
+      and lqmod.normalize_name("Müller Fitness") == lqmod.normalize_name("Mueller Fitness"))
+check("domain normalization",
+      lqmod.normalize_domain("https://www.Example.com/foo?x=1") == "example.com"
+      and lqmod.normalize_domain("http://example.com:8080/") == "example.com"
+      and lqmod.normalize_domain("www.example.com") == "example.com")
+
+# --- find_duplicate_lead + merge_lead_fields ---
+c_dd = make_campaign(cq, "DedupCamp")
+d1 = add_lead(c_dd, uq["id"], "d1@example.com", "Sunshine Yoga")
+db.w("UPDATE leads SET website=? WHERE id=?", ("https://sunshine-yoga.example", d1))
+dup = lqmod.find_duplicate_lead(c_dd, "Sunshine Yoga GmbH", "https://www.sunshine-yoga.example/")
+check("duplicate found across name and URL variants", dup and dup["id"] == d1)
+check("no false positive on different business",
+      lqmod.find_duplicate_lead(c_dd, "Other Studio", "https://other.example") is None)
+merged = lqmod.merge_lead_fields(d1, name="Sunshine Yoga Berlin", address="Hauptstr. 1",
+                                 phone="030-123", website="https://sunshine-yoga.example",
+                                 email="new@example.com")
+lead_d = db.q("SELECT * FROM leads WHERE id=?", (d1,), one=True)
+check("merge fills gaps, keeps existing email, prefers longer name",
+      merged and lead_d["address"] == "Hauptstr. 1" and lead_d["phone"] == "030-123"
+      and lead_d["email"] == "d1@example.com"
+      and lead_d["business_name"] == "Sunshine Yoga Berlin")
+check("merge with nothing new returns False",
+      not lqmod.merge_lead_fields(d1, name="Sun", address="Hauptstr. 1"))
+
+# --- CSV import merges near-duplicates instead of new rows ---
+n2, m2, e2 = leadsmod.import_csv(uq["id"], c_dd, _io.BytesIO(
+    b"business_name,website,email,phone,rating\n"
+    b"SUNSHINE YOGA,www.sunshine-yoga.example,other@example.com,030-999,4.8\n"
+    b"Brand New,https://brandnew.example,,\n"))
+check("csv merges near-duplicate, imports the rest",
+      n2 == 1 and m2 == 1 and not e2
+      and db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+               (c_dd,), one=True)["c"] == 2
+      and db.q("SELECT rating FROM leads WHERE id=?", (d1,), one=True)["rating"] == "4.8",
+      f"n2={n2} m2={m2} e2={e2}")
+
+# --- manual add merges near-duplicates ---
+c_man = make_campaign(cq, "ManualCamp")
+leadsmod.add_manual(uq["id"], c_man, {"business_name": "Acme Gym",
+                                      "website": "https://acme-gym.example", "phone": "111"})
+leadsmod.add_manual(uq["id"], c_man, {"business_name": "ACME GYM GmbH",
+                                      "website": "https://www.acme-gym.example/",
+                                      "address": "Main St 1"})
+rows_man = db.q("SELECT * FROM leads WHERE campaign_id=?", (c_man,))
+check("manual add merges near-duplicate into one lead",
+      len(rows_man) == 1 and rows_man[0]["address"] == "Main St 1"
+      and rows_man[0]["phone"] == "111")
+
+# --- chain / franchise detection ---
+check("known chains flagged",
+      lqmod.detect_fit("McFIT Berlin Mitte") == "possible_chain"
+      and lqmod.detect_fit("FitX Hamburg GmbH") == "possible_chain"
+      and lqmod.detect_fit("Mrs.Sporty Kreuzberg") == "possible_chain")
+check("independents not flagged",
+      lqmod.detect_fit("Sunshine Yoga Studio") == ""
+      and lqmod.detect_fit("Enrich Gym") == "")
+check("franchise wording flagged",
+      lqmod.detect_fit("Power Gym",
+                       page_text="Werde Franchise-Partner und eroeffne dein Studio")
+      == "possible_chain")
+check("many locations flagged",
+      lqmod.detect_fit("Power Gym",
+                       page_text="Unsere Standorte in Berlin und Hamburg. "
+                                 "Alle Standorte und Filialen im Ueberblick. "
+                                 "Jede unserer Filialen hat ein Team.")
+      == "possible_chain")
+
+# --- enrichment persists address and marks fit ---
+c_en = make_campaign(cq, "EnrichCamp")
+db.w("UPDATE campaigns SET niche='gyms', location='Berlin', pipeline_stage='enrich' WHERE id=?",
+     (c_en,))
+e1 = db.w("INSERT INTO leads (user_id, campaign_id, business_name, website, email, selected, created_at)"
+          " VALUES (?,?,?,?,?,?,?)",
+          (uq["id"], c_en, "Enrich Gym", "https://enrich-gym.example", "", 1, time.time()))
+
+
+def fake_enrich_addr(rows, pause=0.8):
+    return [{"lead_id": r["id"], "email": "info@enrich-gym.example", "phone": "030-1",
+             "address": "Torstr. 1, 10119 Berlin", "has_contact_form": False,
+             "pages_checked": 2, "page_text": "Welcome to Enrich Gym"} for r in rows]
+
+
+with mock.patch("enrich.enrich_leads", side_effect=fake_enrich_addr):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (c_en,), one=True)
+    pipelinemod.tick_campaign(camp)
+lead_e = db.q("SELECT * FROM leads WHERE id=?", (e1,), one=True)
+check("enrich persists address, email stays unvalidated, fit independent",
+      lead_e["address"] == "Torstr. 1, 10119 Berlin"
+      and lead_e["email"] == "info@enrich-gym.example" and lead_e["email_verdict"] == ""
+      and lead_e["fit"] == "independent")
+
+# --- discovery flags chains and merges URL variants ---
+c_disc = make_campaign(cq, "DiscCamp")
+db.w("UPDATE campaigns SET niche='gyms', location='Berlin', pipeline_stage='discover' WHERE id=?",
+     (c_disc,))
+
+
+def fake_ddg(q):
+    return ["https://mcfit-berlin.example", "https://www.mcfit-berlin.example/preise"]
+
+
+def fake_ident(url):
+    return {"name": "McFIT Berlin", "phone": "", "address": ""}
+
+
+with mock.patch("scrapers.websearch.ddg_links", side_effect=fake_ddg), \
+     mock.patch("scrapers.websearch._site_identity", side_effect=fake_ident), \
+     mock.patch.object(pipelinemod, "discovery_verdict", return_value=(True, "ok")):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (c_disc,), one=True)
+    pipelinemod.tick_campaign(camp)
+rows_disc = db.q("SELECT * FROM leads WHERE campaign_id=?", (c_disc,))
+check("discovery merges URL variants into one lead and flags the chain",
+      len(rows_disc) == 1 and rows_disc[0]["fit"] == "possible_chain",
+      f"rows={len(rows_disc)}")
+
+# --- quality badges and fit render on the campaign page ---
+db.w("UPDATE leads SET fit='possible_chain', address='Rangestr. 1' WHERE id=?", (g_risky,))
+g_ui = add_lead(c_gate, uq["id"], "ui@example.com", "UI Biz", verdict="valid")
+db.w("UPDATE leads SET website=?, address=?, fit='independent' WHERE id=?",
+     ("https://ui-biz.example", "Teststr. 1", g_ui))
+r = cq.get(f"/campaign/{c_gate}")
+html = r.data.decode()
+check("campaign page shows quality badges and fit",
+      "Email verified" in html and "Email not verified" in html and "No email" not in html
+      and "Site found" in html and "Address found" in html
+      and "Possible chain" in html and "Independent" in html)
+
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:

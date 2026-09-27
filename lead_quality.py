@@ -118,7 +118,8 @@ def find_duplicate_lead(campaign_id, name, website):
     return None
 
 
-def merge_lead_fields(lead_id, name="", address="", phone="", website=""):
+def merge_lead_fields(lead_id, name="", address="", phone="", website="",
+                      email="", rating="", review_count=""):
     """Fill gaps on an existing lead from newly discovered data. Never
     overwrites a field the lead already has; prefers the longer business
     name when the new one is more specific. Returns True when merged."""
@@ -126,12 +127,18 @@ def merge_lead_fields(lead_id, name="", address="", phone="", website=""):
     if not lead:
         return False
     updates = {}
-    if not (lead["address"] or "").strip() and (address or "").strip():
-        updates["address"] = address.strip()
-    if not (lead["phone"] or "").strip() and (phone or "").strip():
-        updates["phone"] = phone.strip()
-    if not (lead["website"] or "").strip() and (website or "").strip():
-        updates["website"] = website.strip()
+
+    def fill(key, val):
+        v = (val or "").strip()
+        if v and not (lead[key] or "").strip():
+            updates[key] = v
+
+    fill("address", address)
+    fill("phone", phone)
+    fill("website", website)
+    fill("email", email)
+    fill("rating", rating)
+    fill("review_count", review_count)
     if (name or "").strip() and len(name.strip()) > len((lead["business_name"] or "")):
         updates["business_name"] = name.strip()
     if not updates:

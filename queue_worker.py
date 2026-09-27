@@ -20,6 +20,7 @@ import time
 from datetime import datetime
 
 import db
+import lead_quality as lq
 import sender
 import followups
 import jobs
@@ -31,16 +32,22 @@ MAX_RUN_SECONDS = 50  # stay well under serverless time limits
 
 
 def enqueue_campaign(user_id, campaign_id):
-    """Queue every selected lead with an email for a campaign.
+    """Queue selected, VALIDATED leads for a campaign and flip it to sending.
 
+    Only emails with a queueable verdict are queued: verdict must be
+    "valid" or "risky" (see lead_quality: syntactically valid, non-disposable,
+    domain has MX records, mailbox confirmed or catch-all). Leads with no
+    email, or with an invalid/unknown/unvalidated verdict, are never queued.
     Unsubscribed, replied, and bounced leads are never queued (same as the
     reply/bounce guards in the pipeline and sequence_gate)."""
+    import lead_quality as lq
     leads = db.q(
-        """SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>''
-           AND unsubscribed=0 AND replied=0
-           AND NOT EXISTS (SELECT 1 FROM send_log b
-                           WHERE b.campaign_id=? AND b.lead_id=leads.id
-                           AND b.status='bounced')""",
+        "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>'' "
+        "AND email_verdict IN " + lq.queueable_verdict_sql() + " "
+        "AND unsubscribed=0 AND replied=0 "
+        "AND NOT EXISTS (SELECT 1 FROM send_log b "
+        "WHERE b.campaign_id=? AND b.lead_id=leads.id "
+        "AND b.status='bounced')",
         (campaign_id, campaign_id))
     now = time.time()
     n = 0
@@ -163,6 +170,17 @@ def _process_campaign(camp, now_ts, send_fn=None):
             outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
                              "to": lead["email"], "step": step,
                              "detail": "Lead replied; sequence stopped."})
+            continue
+        if not lq.is_queueable_verdict(lead.get("email_verdict")):
+            # Belt-and-suspenders: an unvalidated/invalid email must never
+            # send, even if it reached the queue through an older path or a
+            # verdict changed after queueing.
+            step = item["step"] or 0
+            db.w("UPDATE send_queue SET status='failed', last_error=? WHERE id=?",
+                 ("Email not validated; skipped.", item["id"]))
+            outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
+                             "to": lead["email"], "step": step,
+                             "detail": "Email not validated; skipped."})
             continue
         step = item["step"] or 0
         if not sender.in_window(camp, datetime.now()):

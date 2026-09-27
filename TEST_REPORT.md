@@ -210,3 +210,49 @@ network failure. `POST /settings/test-ai` generates a sample subject + opener
 for a fictional sample business with the stored AI key and displays the
 draft; explains setup when no key is configured. Keys never rendered.
 Buttons disable while a test runs.
+
+## Data quality hardening (19)
+New shared module `lead_quality.py`: the single home for every data-quality
+decision (verification gate, dedup normalization, chain detection).
+
+What "validated" means (documented in `lead_quality.py` and enforced
+everywhere): only `email_verdict` "valid" or "risky" may enter the send
+queue. valid = syntax OK, not disposable, domain has MX records, mailbox
+confirmed on a non-catch-all server. risky = syntax OK, MX exists, but the
+server is catch-all so the mailbox could not be confirmed. invalid (bad
+syntax, disposable, no MX, mailbox rejected), unknown (probe blocked or
+greylisted), none/"" (no public email found) are never queued. The manual
+enqueue path (`queue_worker.enqueue_campaign`, used by "Queue selected
+leads & start sending") now applies the same verdict gate the pipeline's
+own `_queue` already had; a send-time gate in `_process_campaign` drops any
+queue item whose verdict is no longer queueable (e.g. changed after
+queueing) as failed with "Email not validated; skipped." CSV-imported and
+manually added leads are selected by default, so they are held back by the
+same gate until validated. Nothing ever guesses an email address.
+
+Dedup: `normalize_name` (lowercase, umlaut folding, punctuation/whitespace
+collapse, trailing legal-entity suffixes like GmbH/UG/Ltd stripped) and
+`normalize_domain` (scheme/path/port/www stripped). `find_duplicate_lead`
+matches by normalized domain first, then normalized name;
+`merge_lead_fields` fills only empty fields and never overwrites verified
+data. Applied to pipeline discovery, the manual websearch job, CSV import
+(which now returns imported/merged/error counts and reports merges in the
+UI), and manual add. Enrichment persists the homepage address
+(`leads.address`) in both the pipeline and the manual enrich job; the
+enrich result also carries truncated homepage `page_text` for chain
+detection.
+
+Chain detection (`detect_fit`, stored on `leads.fit` via an idempotent
+migration): known gym-chain brands by normalized name (McFIT, FitX, John
+Reed, Clever Fit, Mrs.Sporty, Injoy, Fitness First, ...), franchise wording
+on the homepage, or 4+ location mentions -> "possible_chain". Name and
+homepage checked with no signals -> "independent" ("no chain signals
+found", not an audit); "" means not checked yet. The ICP is independent
+gyms (1-3 locations, no in-house marketing team), so possible chains are
+flagged for review, never auto-dropped.
+
+UI: the campaign leads table has "Quality" badges in plain language (Email
+verified / Email risky / Email not verified / No email; Site found / No
+site; Address found / No address) and a "Fit" column (Independent /
+Possible chain). The Send queue card notes that only verified emails can be
+queued and imported lists need "Validate emails" first.

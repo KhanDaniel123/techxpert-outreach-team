@@ -100,9 +100,12 @@ def _jsonld_business(html):
 
 
 def enrich_website(website, pause=1.0):
-    """Returns dict: emails, email, has_contact_form, phone, name, address, pages_checked, error."""
+    """Returns dict: emails, email, has_contact_form, phone, name, address,
+    pages_checked, page_text, error. page_text is the homepage's visible
+    text (truncated), used for chain/franchise signal detection."""
     result = {"emails": [], "email": "", "has_contact_form": False, "phone": "",
-              "name": "", "address": "", "pages_checked": 0, "error": ""}
+              "name": "", "address": "", "pages_checked": 0, "page_text": "",
+              "error": ""}
     base = _clean_url(website)
     if not base:
         result["error"] = "no website"
@@ -134,6 +137,14 @@ def enrich_website(website, pause=1.0):
         result["email"] = result["emails"][0] if result["emails"] else ""
         soup = BeautifulSoup(seen_html[0], "html.parser")
         result["has_contact_form"] = _has_contact_form(soup)
+        # Visible homepage text for chain/franchise signal detection
+        # (lead_quality.detect_fit). Scripts/styles stripped, truncated.
+        try:
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            result["page_text"] = soup.get_text(" ", strip=True)[:3000]
+        except Exception:
+            result["page_text"] = ""
         if not result["phone"]:
             phones = PHONE_RE.findall(seen_html[0])
             result["phone"] = phones[0] if phones else ""

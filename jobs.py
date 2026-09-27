@@ -113,16 +113,23 @@ def _websearch_chunk(job):
         if not name:
             name = urlparse(url).netloc.replace("www.", "")
         site = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
-        dup = db.q("SELECT id FROM leads WHERE campaign_id=? AND website=?",
-                   (job["campaign_id"], site), one=True)
-        if not dup:
+        address = ident.get("address", "")
+        phone = ident.get("phone", "")
+        dup = lq.find_duplicate_lead(job["campaign_id"], name, site)
+        if dup:
+            # Near-duplicate (e.g. "McFIT Berlin GmbH" vs "mcfit berlin"):
+            # merge new fields into the existing lead, never a new row.
+            lq.merge_lead_fields(dup["id"], name=name, address=address,
+                                 phone=phone, website=site)
+        else:
             db.w(
                 """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
-                   website, email, rating, review_count, category, source, notes, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job["user_id"], job["campaign_id"], name, ident.get("address", ""),
-                 ident.get("phone", ""), site, "", "", "", camp["niche"] if camp else "",
-                 "websearch", f"found via web search: {p.get('query', '')}", time.time()))
+                   website, email, rating, review_count, category, source, notes, fit, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job["user_id"], job["campaign_id"], name, address,
+                 phone, site, "", "", "", camp["niche"] if camp else "",
+                 "websearch", f"found via web search: {p.get('query', '')}",
+                 lq.detect_fit(name, niche), time.time()))
             added += 1
     idx += WEBSEARCH_FETCH_PER_CHUNK
     p["idx"] = idx
@@ -160,26 +167,43 @@ def _enrich_chunk(job):
                   result="nothing to enrich (no unleaded websites)")
             return
     rows = db.q(
-        "SELECT id, website FROM leads WHERE campaign_id=? AND website<>'' AND email='' "
+        "SELECT id, website, business_name, fit FROM leads WHERE campaign_id=? AND website<>'' AND email='' "
         "ORDER BY id LIMIT ?",
         (job["campaign_id"], ENRICH_PER_CHUNK))
     if not rows:
         _save(job["id"], status="done", result="enrichment complete")
         return
     results = enrichmod.enrich_leads(rows, pause=0.8)
+    camp = db.q("SELECT niche FROM campaigns WHERE id=?", (job["campaign_id"],), one=True)
+    niche = (camp["niche"] if camp else "") or ""
+    by_id = {r["id"]: r for r in rows}
     updated = 0
     for res in results:
-        if res["email"]:
-            verdict, detail = _validate_one_email(res["email"])
+        lid = res.get("lead_id")
+        lead = by_id.get(lid) or {}
+        # Chain/franchise check, now that the homepage text is available.
+        sig = lq.detect_fit(lead.get("business_name", ""), niche,
+                            res.get("page_text", ""))
+        if sig:
+            db.w("UPDATE leads SET fit=? WHERE id=?", (sig, lid))
+        elif not (lead.get("fit") or ""):
+            # Name and homepage checked, no chain signals found.
+            db.w("UPDATE leads SET fit='independent' WHERE id=?", (lid,))
+        addr = res.get("address", "") or ""
+        email = res.get("email", "") or ""
+        if email:
+            verdict, detail = _validate_one_email(email)
             db.w("""UPDATE leads SET email=?, email_verdict=?, email_verdict_detail=?,
-                    has_contact_form=?, phone=COALESCE(NULLIF(phone,''), ?), notes=? WHERE id=?""",
-                 (res["email"], verdict, detail,
-                  1 if res["has_contact_form"] else 0,
-                  res["phone"] or "", f"enriched {res['pages_checked']} pages", res["lead_id"]))
+                    has_contact_form=?, phone=COALESCE(NULLIF(phone,''), ?),
+                    address=COALESCE(NULLIF(address,''), ?), notes=? WHERE id=?""",
+                 (email, verdict, detail,
+                  1 if res.get("has_contact_form") else 0,
+                  res.get("phone") or "", addr,
+                  f"enriched {res.get('pages_checked', 0)} pages", lid))
             updated += 1
-        elif res["has_contact_form"]:
+        elif res.get("has_contact_form"):
             db.w("UPDATE leads SET has_contact_form=1, notes='contact form, no public email' WHERE id=?",
-                 (res["lead_id"],))
+                 (lid,))
     done = db.q("SELECT done FROM jobs WHERE id=?", (job["id"],), one=True)["done"] or 0
     _save(job["id"], done=done + len(rows),
           result=f"{updated} new emails so far")

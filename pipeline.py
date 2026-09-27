@@ -34,6 +34,7 @@ import re
 import time
 
 import db
+import lead_quality as lq
 
 log = logging.getLogger(__name__)
 
@@ -386,16 +387,25 @@ def _discover(camp):
         if not name:
             name = dom.replace("www.", "")
         site = f"{urlparse(url).scheme}://{dom}"
-        dup = db.q("SELECT id FROM leads WHERE campaign_id=? AND website=?",
-                   (cid, site), one=True)
-        if not dup:
+        address = (ident or {}).get("address", "")
+        phone = (ident or {}).get("phone", "")
+        dup = lq.find_duplicate_lead(cid, name, site)
+        if dup:
+            # Same business found twice (e.g. "McFIT Berlin Mitte" vs
+            # "mcfit berlin mitte gmbh"): merge new fields into the existing
+            # row instead of creating a duplicate lead.
+            if lq.merge_lead_fields(dup["id"], name=name, address=address,
+                                    phone=phone, website=site):
+                log.info("discovery merged duplicate: %s into lead %s",
+                         site, dup["id"])
+        else:
             db.w(
                 """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
-                   website, email, rating, review_count, category, source, notes, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (camp["user_id"], cid, name, (ident or {}).get("address", ""),
-                 (ident or {}).get("phone", ""), site, "", "", "",
-                 niche, "pipeline", f"pipeline discovery: {query}", time.time()))
+                   website, email, rating, review_count, category, source, notes, fit, created_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (camp["user_id"], cid, name, address, phone, site, "", "", "",
+                 niche, "pipeline", f"pipeline discovery: {query}",
+                 lq.detect_fit(name, niche), time.time()))
             added += 1
         seen_domains.add(dom)
     if _lead_count(cid) >= target:
@@ -410,27 +420,41 @@ def _enrich(camp):
     import enrich as enrichmod
     cid = camp["id"]
     rows = db.q(
-        "SELECT id, website FROM leads WHERE campaign_id=? AND website<>'' "
+        "SELECT id, website, business_name, fit FROM leads WHERE campaign_id=? AND website<>'' "
         "AND email='' AND COALESCE(email_verdict,'')='' ORDER BY id LIMIT ?",
         (cid, ENRICH_PER_TICK))
     if not rows:
         return "validate"
     results = enrichmod.enrich_leads(rows, pause=0.8)
+    niche = (camp.get("niche") or "").strip()
+    by_id = {r["id"]: r for r in rows}
     for res in results:
+        lead = by_id.get(res["lead_id"]) or {}
+        # Chain/franchise check, now that the homepage text is available.
+        sig = lq.detect_fit(lead.get("business_name", ""), niche,
+                            res.get("page_text", ""))
+        if sig:
+            db.w("UPDATE leads SET fit=? WHERE id=?", (sig, res["lead_id"]))
+        elif not (lead.get("fit") or ""):
+            # Name and homepage checked, no chain signals found.
+            db.w("UPDATE leads SET fit='independent' WHERE id=?", (res["lead_id"],))
+        addr = res.get("address", "") or ""
         if res["email"]:
             # Found a public address; validation happens in the next stage.
             db.w("""UPDATE leads SET email=?, email_verdict='',
                     phone=COALESCE(NULLIF(phone,''), ?),
+                    address=COALESCE(NULLIF(address,''), ?),
                     has_contact_form=?, notes=? WHERE id=?""",
-                 (res["email"], res["phone"] or "",
+                 (res["email"], res["phone"] or "", addr,
                   1 if res["has_contact_form"] else 0,
                   f"pipeline: public email found ({res['pages_checked']} pages)",
                   res["lead_id"]))
         else:
             # No public email: listed, skipped silently from here on.
             db.w("""UPDATE leads SET email_verdict='none', has_contact_form=?,
+                    address=COALESCE(NULLIF(address,''), ?),
                     notes='pipeline: no public email found' WHERE id=?""",
-                 (1 if res["has_contact_form"] else 0, res["lead_id"]))
+                 (1 if res["has_contact_form"] else 0, addr, res["lead_id"]))
     return None
 
 
@@ -475,7 +499,7 @@ def _write(camp):
         return "queue"
     rows = db.q(
         "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>'' "
-        "AND email_verdict IN ('valid','risky') "
+        "AND email_verdict IN " + lq.queueable_verdict_sql() + " "
         "AND (ai_status IS NULL OR ai_status='') ORDER BY id LIMIT ?",
         (cid, WRITE_PER_TICK))
     if not rows:
@@ -495,18 +519,19 @@ def _queue(camp):
     """Queue validated, never-contacted leads into the normal send flow."""
     cid = camp["id"]
     rows = db.q(
-        """SELECT l.* FROM leads l WHERE l.campaign_id=? AND l.selected=1
-           AND l.email<>'' AND l.email_verdict IN ('valid','risky') AND l.replied=0
-           AND l.unsubscribed=0
-           AND NOT EXISTS (SELECT 1 FROM send_queue q
-                           WHERE q.campaign_id=l.campaign_id AND q.lead_id=l.id)
-           AND NOT EXISTS (SELECT 1 FROM send_log s
-                           WHERE s.campaign_id=l.campaign_id AND s.lead_id=l.id
-                           AND s.status IN ('sent','dry-run'))
-           AND NOT EXISTS (SELECT 1 FROM send_log b
-                           WHERE b.campaign_id=l.campaign_id AND b.lead_id=l.id
-                           AND b.status='bounced')
-           ORDER BY l.id LIMIT ?""",
+        ("SELECT l.* FROM leads l WHERE l.campaign_id=? AND l.selected=1 "
+         "AND l.email<>'' AND l.email_verdict IN " + lq.queueable_verdict_sql() +
+         " AND l.replied=0 "
+         "AND l.unsubscribed=0 "
+         "AND NOT EXISTS (SELECT 1 FROM send_queue q "
+         "WHERE q.campaign_id=l.campaign_id AND q.lead_id=l.id) "
+         "AND NOT EXISTS (SELECT 1 FROM send_log s "
+         "WHERE s.campaign_id=l.campaign_id AND s.lead_id=l.id "
+         "AND s.status IN ('sent','dry-run')) "
+         "AND NOT EXISTS (SELECT 1 FROM send_log b "
+         "WHERE b.campaign_id=l.campaign_id AND b.lead_id=l.id "
+         "AND b.status='bounced') "
+         "ORDER BY l.id LIMIT ?"),
         (cid, QUEUE_PER_TICK))
     now = time.time()
     for lead in rows:
@@ -577,7 +602,7 @@ def stats(cid):
     found = one("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cid,))
     emails = one("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND email<>''", (cid,))
     validated = one(
-        "SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND email_verdict IN ('valid','risky')",
+        "SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND email_verdict IN " + lq.queueable_verdict_sql(),
         (cid,))
     sent = one(
         "SELECT COUNT(DISTINCT lead_id) c FROM send_log WHERE campaign_id=? "

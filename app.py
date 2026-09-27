@@ -531,9 +531,12 @@ def campaign_import(cid):
     if not f or not f.filename:
         return ("Choose a CSV file first, then click Import. "
                 "No file was uploaded, so nothing was imported."), 400
-    n, errors = leadmod.import_csv(uid(), cid, f.stream)
+    n, merged, errors = leadmod.import_csv(uid(), cid, f.stream)
+    msg = f"Imported {n} leads."
+    if merged:
+        msg += f" {merged} duplicate row(s) merged into existing leads."
     return render_template("message.html", title="CSV import",
-                           message=f"Imported {n} leads." + (f" Errors: {'; '.join(errors[:5])}" if errors else ""),
+                           message=msg + (f" Errors: {'; '.join(errors[:5])}" if errors else ""),
                            back=url_for("campaign", cid=cid), user=current_user())
 
 
@@ -541,7 +544,7 @@ def campaign_import(cid):
 def campaign_sample(cid):
     if not _own_campaign(cid):
         return "Campaign not found", 404
-    n, errors = leadmod.import_csv(uid(), cid, io.BytesIO(leadmod.SAMPLE_CSV.encode()), source="sample")
+    n, merged, errors = leadmod.import_csv(uid(), cid, io.BytesIO(leadmod.SAMPLE_CSV.encode()), source="sample")
     return redirect(url_for("campaign", cid=cid))
 
 
