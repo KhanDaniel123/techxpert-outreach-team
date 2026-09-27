@@ -1,0 +1,10 @@
+{% extends "base.html" %}{% block t %}Notifications{% endblock %}{% block b %}
+<h1>Notifications</h1>
+<div class="card">
+{% for n in notes %}<div class="note">
+<div><b>{{ n.title }}</b> <small>{{ n.when }}</small></div>
+{% if n.snippet %}<p><small>{{ n.snippet[:300] }}{% if n.snippet|length > 300 %}...{% endif %}</small></p>{% endif %}
+{% if n.campaign_id %}<small><a href="/campaign/{{ n.campaign_id }}">Open campaign</a></small>{% endif %}
+</div>{% else %}<p><small>No notifications yet. Replies from your prospects will show up here.</small></p>{% endfor %}
+</div>
+{% endblock %}
