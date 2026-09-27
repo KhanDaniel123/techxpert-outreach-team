@@ -25,7 +25,7 @@
 <td><b>{{ r.business_name }}</b></td>
 <td class="mono"><small>{{ r.email }}</small></td>
 <td>{{ r.campaign_name or '' }}</td>
-<td><small>{{ r.snippet[:140] }}{% if r.snippet and r.snippet|length > 140 %}...{% endif %}</small></td>
+<td><small>{{ (r.snippet or '')[:140] }}{% if r.snippet and r.snippet|length > 140 %}...{% endif %}</small></td>
 <td><small>{{ r.when }}</small></td>
 <td><div class="actions" style="margin:0">
 {% if r.campaign_id %}<a class="btn ghost" href="/campaign/{{ r.campaign_id }}">Open campaign</a>{% endif %}
