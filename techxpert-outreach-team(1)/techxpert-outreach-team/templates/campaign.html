@@ -20,6 +20,7 @@
 <div><input name="website" placeholder="Website"></div>
 <div><input name="email" placeholder="Email"></div>
 <div><input name="phone" placeholder="Phone"></div>
+<div><input name="personalized_line" placeholder="Personalized line (optional)"></div>
 <div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
 <div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Form?</th><th>Sequence</th><th>Notes</th></tr>
 {% for l in leads %}<tr>
@@ -32,13 +33,13 @@
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
 <td>{{ 'yes' if l.has_contact_form else '' }}</td>
 <td><span class="pill {{ seq.get(l.id, ('-', 'mut'))[1] }}">{{ seq.get(l.id, ('-', 'mut'))[0] }}</span></td>
-<td><small>{{ l.notes }}</small></td></tr>
+<td><small>{{ l.notes }}</small>{% if l.personalized_line %}<br><small style="color:#9bd8ff">{{ l.personalized_line }}</small>{% endif %}</td></tr>
 {% else %}<tr><td colspan="9"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
 
 <div class="card"><h2>Message template</h2>
 <form method="post" action="/campaign/{{ campaign.id }}/template">
 <p><label><small>Subject</small></label><input name="subject_tpl" value="{{ campaign.subject_tpl }}"></p>
-<p><label><small>Body (variables: {business_name} {phone} {website} {category} / spintax: {a|b})</small></label>
+<p><label><small>Body (variables: {business_name} {phone} {website} {category} {personalized_line} / spintax: {a|b})</small></label>
 <textarea name="body_tpl" rows="7">{{ campaign.body_tpl }}</textarea></p>
 <div class="row">
 <div><label><small>Delay min (s)</small></label><input type="number" name="delay_min" value="{{ campaign.delay_min }}"></div>

@@ -347,7 +347,7 @@ def campaign_add_lead(cid):
         return "Campaign not found", 404
     leadmod.add_manual(uid(), cid, {k: request.form.get(k, "") for k in
                                     ["business_name", "address", "phone", "website",
-                                     "email", "category", "notes"]})
+                                     "email", "category", "notes", "personalized_line"]})
     return redirect(url_for("campaign", cid=cid))
 
 

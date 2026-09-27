@@ -195,7 +195,8 @@ def _migrate():
                       "followup_delay_hours INTEGER DEFAULT 40"],
         "send_queue": ["step INTEGER DEFAULT 0"],
         "send_log": ["step INTEGER DEFAULT 0"],
-        "leads": ["replied INTEGER DEFAULT 0"],
+        "leads": ["replied INTEGER DEFAULT 0",
+                  "personalized_line TEXT"],
     }
     for table, cols in want.items():
         for ddl in cols:

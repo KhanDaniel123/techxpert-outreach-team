@@ -48,6 +48,7 @@ def render_template(tpl, lead, rng=None):
         "website": lead["website"] or "",
         "email": lead["email"] or "",
         "category": lead["category"] or "",
+        "personalized_line": lead.get("personalized_line") or "",
         "niche": "",
         "location": "",
     }

@@ -3,7 +3,8 @@
 Covers: registration/login/logout, wrong-password rejection, password
 hashing, per-user isolation, sender accounts (App Password + mocked SMTP),
 follow-up sequences (config, chaining, gating, reply detection), mocked SMTP
-sending, IMAP bounce/reply scans, and the preserved engine behavior
+sending, IMAP bounce/reply scans, {personalized_line} template variable
+(CSV/manual import, rendering, idempotent migration), and the preserved engine behavior
 (spintax, rotation, caps, warmup, dry-run, windows, enrichment, validation,
 cron auth).
 
@@ -437,6 +438,60 @@ check("nested spintax", sender.resolve_spintax("{{x|y}|z}", _r.Random(1)) in ("x
 lead_t = {"business_name": "Biz", "address": "", "phone": "", "website": "",
           "email": "", "category": "", "niche": "", "location": ""}
 check("template vars", sender.render_template("Hi {business_name} {niche}", lead_t) == "Hi Biz ")
+
+# ================= 7b. personalized_line variable =================
+import leads as leadsmod
+lead_p = dict(lead_t, business_name="Acme", personalized_line="loved your 5-star reviews on fast installs")
+check("personalized_line renders in subject",
+      sender.render_template("Quick one, {business_name} - {personalized_line}", lead_p) ==
+      "Quick one, Acme - loved your 5-star reviews on fast installs")
+check("personalized_line renders in body",
+      sender.render_template("Hi {business_name},\n{personalized_line}\nWorth a chat?", lead_p) ==
+      "Hi Acme,\nloved your 5-star reviews on fast installs\nWorth a chat?")
+lead_blank = dict(lead_t)  # no personalized_line key at all
+check("personalized_line blank when key missing",
+      sender.render_template("Hi {business_name}. {personalized_line}Bye", lead_blank) == "Hi Biz. Bye")
+lead_empty = dict(lead_t, personalized_line="")
+check("personalized_line blank when empty string",
+      sender.render_template("A{personalized_line}B", lead_empty) == "AB")
+check("existing vars unaffected by new key",
+      sender.render_template("{business_name}|{category}|{website}", dict(lead_p, category="HVAC", website="w.com")) ==
+      "Acme|HVAC|w.com")
+check("unknown var still left literally",
+      sender.render_template("Hi {not_a_var}", lead_p) == "Hi {not_a_var}")
+check("spintax + personalized_line combine",
+      sender.render_template("{Hi|Hello} {personalized_line}", lead_p).startswith(("Hi ", "Hello ")) and
+      sender.render_template("{Hi|Hello} {personalized_line}", lead_p).endswith("loved your 5-star reviews on fast installs"))
+
+# migration is idempotent and the column exists
+db._migrate()
+cols = [r["name"] for r in db.q("PRAGMA table_info(leads)")]
+check("leads.personalized_line column exists after migrate", "personalized_line" in cols, str(cols))
+db._migrate()  # second run must not error
+
+# CSV import reads the personalized_line column
+import io as _io
+u_pl = make_user("pl@example.com")
+camp_pl = db.q("SELECT id FROM campaigns WHERE user_id=?", (u_pl["id"],), one=True)
+if not camp_pl:
+    cid_pl = db.w("INSERT INTO campaigns (user_id, name, created_at) VALUES (?,?,?)",
+                  (u_pl["id"], "PL Test", time.time()))
+else:
+    cid_pl = camp_pl["id"]
+n, errs = leadsmod.import_csv(u_pl["id"], cid_pl, _io.BytesIO(
+    b"business_name,email,personalized_line\nAcme Co,a@acme.com,saw your new trucks on the road\nNoLine Co,b@noline.com,\n"))
+row_pl = db.q("SELECT * FROM leads WHERE campaign_id=? ORDER BY id", (cid_pl,))
+check("csv imports personalized_line", n == 2 and not errs and
+      row_pl[0]["personalized_line"] == "saw your new trucks on the road" and
+      row_pl[1]["personalized_line"] == "", str(errs))
+# render from a real DB row (SELECT * shape)
+check("render from db row", sender.render_template("Hey {personalized_line}!", row_pl[0]) ==
+      "Hey saw your new trucks on the road!")
+# manual add accepts it
+leadsmod.add_manual(u_pl["id"], cid_pl, {"business_name": "Manual Co", "email": "m@m.com",
+                                         "personalized_line": "hand-written hook"})
+row_m = db.q("SELECT personalized_line FROM leads WHERE business_name=?", ("Manual Co",), one=True)
+check("manual add stores personalized_line", row_m["personalized_line"] == "hand-written hook")
 
 # rotation: two accounts alternate
 u3 = make_user("u3@example.com")

@@ -3,7 +3,7 @@
 Run: `/tmp/v2venv/bin/python tests/test_all.py`
 Date: 2026-09-27. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**83 passed, 0 failed.**
+**94 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -45,7 +45,7 @@ mailer-daemon and the account's own address; `mark_replies` is
 case-insensitive and user-scoped; `scan_bounces` extracts the failed
 recipient; IMAP failures degrade to `[]` (never raise).
 
-## Preserved engine (20)
+## Preserved engine (20) + personalized_line (11)
 Spintax (incl. nested), template variables, round-robin rotation, caps/paused
 exclusion, 21-day warmup ramp, enqueue, dry-run processing + logging, dry-run
 follow-up previews, campaign stays `sending` while follow-ups pending,
@@ -54,6 +54,10 @@ sending-window deferral, cron 401 without secret / 200 with secret (with
 template save + preview, validator fast paths (bad syntax, disposable), mocked
 validate and enrich job chunks, no `gmail_oauth`/`GOOGLE_CLIENT_ID`/
 `GOOGLE_CLIENT_SECRET` references anywhere in app code.
+`{personalized_line}` renders in subject/body, blank when empty or missing,
+existing variables unaffected, unknown `{vars}` still left literally, spintax
+combines with it, idempotent migration adds `leads.personalized_line`, CSV
+import reads the column, manual add stores it, DB-row rendering works.
 
 ## Not covered by automated tests (do live after deploy)
 One supervised real Gmail send (App Password login from Vercel's network),
