@@ -1953,6 +1953,249 @@ check("campaign page shows quality badges and fit",
       and "Site found" in html and "Address found" in html
       and "Possible chain" in html and "Independent" in html)
 
+# ================= 14. geo.py: global location + language =================
+import geo as geomod
+
+check("parse_location: Berlin, Germany",
+      geomod.parse_location("Berlin, Germany") == ("Berlin", "Germany"))
+check("parse_location: Lyon, France",
+      geomod.parse_location("Lyon, France") == ("Lyon", "France"))
+check("parse_location: Austin TX strips state abbrev",
+      geomod.parse_location("Austin TX") == ("Austin", ""))
+check("parse_location: empty", geomod.parse_location("") == ("", ""))
+
+check("location_language: Berlin, Germany -> de",
+      geomod.location_language("Berlin, Germany") == "de")
+check("location_language: Lyon, France -> fr",
+      geomod.location_language("Lyon, France") == "fr")
+check("location_language: Madrid, Spain -> es",
+      geomod.location_language("Madrid, Spain") == "es")
+check("location_language: Sao Paulo, Brazil -> pt",
+      geomod.location_language("São Paulo, Brazil") == "pt")
+check("location_language: Rome, Italy -> it",
+      geomod.location_language("Rome, Italy") == "it")
+check("location_language: Amsterdam, Netherlands -> nl",
+      geomod.location_language("Amsterdam, Netherlands") == "nl")
+check("location_language: Austin TX -> en (no country)",
+      geomod.location_language("Austin TX") == "en")
+check("location_language: Lahore, Pakistan -> en (fallback)",
+      geomod.location_language("Lahore, Pakistan") == "en")
+check("location_language: Rio de Janeiro, Brazil -> pt not de",
+      geomod.location_language("Rio de Janeiro, Brazil") == "pt")
+check("location_language: Paris, Texas -> en not es",
+      geomod.location_language("Paris, Texas") == "en")
+check("location_language: empty -> en", geomod.location_language("") == "en")
+check("country coverage >= 40 entries", len(geomod.COUNTRY_LANGUAGES) >= 40,
+      str(len(geomod.COUNTRY_LANGUAGES)))
+
+check("translate_niche: french gyms",
+      geomod.translate_niche("Gyms and fitness centers", "fr")
+      == "salles de sport et salles de sport")
+check("translate_niche: german gyms",
+      geomod.translate_niche("Gyms and fitness centers", "de")
+      == "Fitnessstudios und Fitnesscenter")
+check("translate_niche: case-insensitive",
+      geomod.translate_niche("GYM", "fr") == "salle de sport")
+check("translate_niche: longest-first (fitness centers not fitness)",
+      geomod.translate_niche("fitness centers", "es") == "gimnasios")
+check("translate_niche: word boundary (gymnasium untouched)",
+      geomod.translate_niche("gymnasium supplies", "fr") == "gymnasium supplies")
+check("translate_niche: english fallback unchanged",
+      geomod.translate_niche("plumber", "en") == "plumber"
+      and geomod.translate_niche("plumber", "xx") == "plumber")
+check("translate_niche: untranslated word kept",
+      geomod.translate_niche("quantum consultants", "de") == "quantum consultants")
+
+# ================= 15. Multilingual query order (Lyon example) =================
+lyon_qs = pipelinemod.build_discovery_queries("Gyms and fitness centers", "Lyon, France")
+lyon_en_idx = next(i for i, q in enumerate(lyon_qs) if "Gyms and fitness centers" in q)
+check("lyon: french queries lead the rotation",
+      all("salles de sport" in q for q in lyon_qs[:3]), str(lyon_qs[:3]))
+check("lyon: french variants before english",
+      all("salles de sport" in q for q in lyon_qs[:3])
+      and lyon_en_idx == 3, f"en_idx={lyon_en_idx}")
+check("lyon: exact first query",
+      lyon_qs[0] == "salles de sport et salles de sport Lyon, France",
+      lyon_qs[0])
+check("lyon: not berlin-specific (no german, no districts)",
+      not any("Fitnessstudio" in q or "Kreuzberg" in q for q in lyon_qs))
+check("pipeline _location_lang delegates to geo",
+      pipelinemod._location_lang("Lyon, France") == "fr"
+      and pipelinemod._location_lang("Berlin, Germany") == "de"
+      and pipelinemod._location_lang("Berlin") == "de"   # district fallback
+      and pipelinemod._location_lang("Austin TX") == "en")
+
+# ================= 16. osm_discovery =================
+import osm_discovery as osmmod
+
+check("osm tags: gym -> fitness_centre",
+      osmmod.niche_tag_groups("gyms") == [("leisure", "fitness_centre")])
+check("osm tags: restaurant", osmmod.niche_tag_groups("Restaurants")
+      == [("amenity", "restaurant")])
+check("osm tags: salon has two groups",
+      osmmod.niche_tag_groups("hair salon")
+      == [("shop", "hairdresser"), ("shop", "beauty")])
+check("osm tags: cafe", osmmod.niche_tag_groups("cafe")
+      == [("amenity", "cafe")])
+check("osm tags: dentist", osmmod.niche_tag_groups("dentist")
+      == [("amenity", "dentist")])
+check("osm tags: hotel", osmmod.niche_tag_groups("hotels")
+      == [("tourism", "hotel")])
+check("osm tags: car repair", osmmod.niche_tag_groups("car repair shops")
+      == [("shop", "car_repair")])
+check("osm tags: plumber unmapped (researched)",
+      osmmod.niche_tag_groups("plumber") is None)
+check("osm tags: electrician unmapped (researched)",
+      osmmod.niche_tag_groups("electrician") is None)
+check("osm tags: hvac unmapped (researched)",
+      osmmod.niche_tag_groups("hvac") is None)
+check("osm tags: unknown niche -> None",
+      osmmod.niche_tag_groups("quantum consulting") is None)
+
+_sample_el = {"type": "node", "id": 1, "tags": {
+    "name": "Bikram Yoga Berlin-Mitte", "leisure": "fitness_centre",
+    "addr:housenumber": "23", "addr:street": "Krausnickstraße",
+    "addr:postcode": "10115", "addr:city": "Berlin",
+    "contact:website": "http://www.bikram-berlin.de/",
+    "phone": "+49 30 123456"}}
+_lead = osmmod.parse_element(_sample_el)
+check("osm parse: full lead",
+      _lead and _lead["business_name"] == "Bikram Yoga Berlin-Mitte"
+      and _lead["address"] == "23 Krausnickstraße, 10115, Berlin"
+      and _lead["phone"] == "+49 30 123456"
+      and _lead["website"] == "http://www.bikram-berlin.de/"
+      and _lead["source"] == "osm", str(_lead))
+check("osm parse: unnamed element skipped",
+      osmmod.parse_element({"tags": {"leisure": "fitness_centre"}}) is None)
+check("osm parse: no contact info skipped",
+      osmmod.parse_element({"tags": {"name": "No Contact Gym"}}) is None)
+check("osm parse: website scheme added",
+      osmmod.parse_element({"tags": {"name": "G", "website": "example.de"}})["website"]
+      == "https://example.de")
+
+class _FakeResp:
+    def __init__(self, payload): self.payload = payload
+    def read(self): return json.dumps(self.payload).encode()
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+
+with mock.patch("urllib.request.urlopen",
+                return_value=_FakeResp([{"lat": "45.75", "lon": "4.83"}])):
+    check("geocode parses lat/lon", osmmod.geocode("Lyon, France") == (45.75, 4.83))
+with mock.patch("urllib.request.urlopen", side_effect=Exception("down")):
+    check("geocode failure -> (None, None)",
+          osmmod.geocode("Nowhere") == (None, None))
+
+with mock.patch.object(osmmod, "query_tag_group",
+                       return_value=[_sample_el]) as _qtg, \
+     mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)):
+    _leads, _nxt, _done = osmmod.discover("gyms", "Berlin, Germany")
+    check("discover: one group -> leads, advances, not exhausted",
+          len(_leads) == 1 and _nxt == 1 and _done is True
+          and _leads[0]["business_name"] == "Bikram Yoga Berlin-Mitte")
+    _leads2, _nxt2, _done2 = osmmod.discover("hair salons", "Berlin, Germany")
+    check("discover: multi-group niche advances without exhausting",
+          _nxt2 == 1 and _done2 is False)
+check("discover: unmapped niche -> exhausted immediately",
+      osmmod.discover("plumber", "Berlin, Germany") == ([], 0, True))
+with mock.patch.object(osmmod, "geocode", return_value=(None, None)):
+    check("discover: geocode failure -> not exhausted (retry later)",
+          osmmod.discover("gyms", "Berlin, Germany") == ([], 0, False))
+
+# ================= 17. Pipeline OSM integration (mocked) =================
+campO = make_campaign(ca, "OsmPipe", dry_run=1)
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
+     "pipeline_target_leads=10, pipeline_cursor='{}', niche='gyms', "
+     "location='Berlin, Germany' WHERE id=?", (campO,))
+_osm_lead = {"business_name": "OSM Fitness Mitte", "address": "Torstr. 1, Berlin",
+             "phone": "", "website": "https://osm-fitness.example",
+             "source": "osm", "notes": "osm test"}
+
+# OSM runs before web search: when OSM yields leads, ddg is never called.
+with mock.patch.object(pipelinemod, "_discover_osm", return_value=1) as _do, \
+     mock.patch("scrapers.websearch.ddg_links",
+                side_effect=AssertionError("web search must not run")):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campO,), one=True)
+    _stage = pipelinemod._discover(camp)
+    check("osm-first: web search skipped when osm yields leads",
+          _do.called and _stage is None)
+
+# OSM lead without a website is kept (allow_no_url), junk still filtered.
+with mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)), \
+     mock.patch.object(osmmod, "discover",
+                       return_value=([dict(_osm_lead, website=""),
+                                      {"business_name": "11 Top Locations",
+                                       "address": "", "phone": "",
+                                       "website": "https://osm-fitness.example",
+                                       "source": "osm", "notes": ""}], 1, True)):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campO,), one=True)
+    _added = pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany")
+_osm_rows = db.q("SELECT business_name, website, source FROM leads WHERE campaign_id=?",
+                 (campO,))
+check("osm: no-website lead kept, listicle dropped",
+      _added == 1 and len(_osm_rows) == 1
+      and _osm_rows[0]["business_name"] == "OSM Fitness Mitte"
+      and _osm_rows[0]["source"] == "osm", str([dict(r) for r in _osm_rows]))
+_cur = json.loads(db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?",
+                       (campO,), one=True)["pipeline_cursor"])
+check("osm: cursor caches coords + marks exhausted",
+      _cur["osm"]["lat"] == 52.5 and _cur["osm"]["exhausted"] is True)
+
+# OSM/web dedup merge: same business via web search merges, no new row.
+with mock.patch.object(pipelinemod, "_discover_osm", return_value=0), \
+     mock.patch("scrapers.websearch.ddg_links",
+                return_value=["https://osm-fitness.example/"]), \
+     mock.patch("scrapers.websearch._site_identity",
+                return_value={"name": "OSM Fitness Mitte", "phone": "030-1",
+                              "address": "Torstr. 1"}):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campO,), one=True)
+    pipelinemod._discover(camp)
+check("osm/web duplicate merged, no new row",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (campO,), one=True)["c"] == 1
+      and db.q("SELECT phone FROM leads WHERE campaign_id=?", (campO,), one=True)["phone"] == "030-1")
+
+# Per-tick cap respected for OSM leads.
+campC = make_campaign(ca, "OsmCap", dry_run=1)
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
+     "pipeline_target_leads=50, pipeline_cursor='{}', niche='gyms', "
+     "location='Berlin, Germany' WHERE id=?", (campC,))
+_many = [dict(_osm_lead, business_name=f"Fitwerk Mitte {i}",
+              website=f"https://gym{i}.example") for i in range(12)]
+with mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)), \
+     mock.patch.object(osmmod, "discover", return_value=(_many, 1, True)):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campC,), one=True)
+    pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany")
+check("osm: per-tick cap respected",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (campC,), one=True)["c"]
+      == pipelinemod.DISCOVER_PER_TICK)
+
+# OSM failure falls back to web search without crashing.
+campF = make_campaign(ca, "OsmFail", dry_run=1)
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
+     "pipeline_target_leads=10, pipeline_cursor='{}', niche='gyms', "
+     "location='Berlin, Germany' WHERE id=?", (campF,))
+with mock.patch.object(osmmod, "geocode", side_effect=Exception("boom")), \
+     mock.patch("scrapers.websearch.ddg_links", return_value=["https://fb.example/"]), \
+     mock.patch("scrapers.websearch._site_identity",
+                return_value={"name": "Fallback Gym", "phone": "", "address": ""}):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campF,), one=True)
+    try:
+        pipelinemod._discover(camp)
+        _no_crash = True
+    except Exception:
+        _no_crash = False
+check("osm failure: falls back to web search, no crash",
+      _no_crash
+      and db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+               (campF,), one=True)["c"] == 1)
+
+# ================= 18. OSM attribution in base template =================
+r = appmod.app.test_client().get("/login")  # anonymous: logged-in /login redirects
+check("footer: openstreetmap attribution rendered",
+      r.status_code == 200
+      and "OpenStreetMap" in r.data.decode()
+      and "openstreetmap.org/copyright" in r.data.decode())
+
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:

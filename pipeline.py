@@ -5,11 +5,14 @@ ticks. Each tick advances ONE stage for each pipeline-enabled campaign:
 
     discover -> enrich -> validate -> write -> queue -> done
 
-  discover : rotating web-search queries built from niche + location
-             (English, German-language variants for Germany, and
-             district-by-district queries for mapped cities) until the
-             target lead count is reached (a few new business domains
-             per tick).
+  discover : OpenStreetMap business data first (real, mapped businesses:
+             Nominatim geocoding + Overpass POIs, no API key, global),
+             then rotating localized web-search queries built from niche +
+             location (local-language variants, e.g. German for Germany,
+             French for France, plus district-by-district queries for
+             mapped cities) until the target lead count is reached (a few
+             new businesses per tick). OSM failures never stall the
+             pipeline: web search covers them.
   enrich   : visit lead websites and extract publicly listed emails.
              Leads with no public email are marked and skipped, never
              retried, never mailed.
@@ -34,6 +37,7 @@ import re
 import time
 
 import db
+import geo
 import lead_quality as lq
 
 log = logging.getLogger(__name__)
@@ -60,20 +64,10 @@ STAGE_LABELS = {
 # location so each scheduler tick searches a fresh angle instead of
 # repeating one generic query. The rotation index lives in the campaign's
 # pipeline_cursor ("q") so it survives restarts.
-NICHE_TRANSLATIONS = {
-    # German variants for common niche words. Matched case-insensitively,
-    # longest phrases first. Falls back to the English niche when nothing
-    # matches.
-    "de": {
-        "fitness centers": "Fitnesscenter",
-        "fitness center": "Fitnesscenter",
-        "fitness centres": "Fitnesscenter",
-        "fitness centre": "Fitnesscenter",
-        "gyms": "Fitnessstudios",
-        "gym": "Fitnessstudio",
-        " and ": " und ",
-    },
-}
+# Niche translations live in geo.py (multilingual: de/fr/es/pt/it/nl,
+# word-boundary, longest-first, case-insensitive; new languages are
+# data-only additions). pipeline keeps thin wrappers below so callers
+# and tests are unaffected.
 
 # Neighborhood/district queries per city (normalized city name -> districts).
 # Lets discovery sweep a metro area district by district. Add more cities
@@ -89,25 +83,20 @@ BASE_QUERY_TEMPLATES = ("{n} {loc}", "{n} in {loc}", "{loc} {n}")
 
 
 def _location_lang(location):
-    """'de' when the location is in Germany, else 'en'."""
-    loc = (location or "").lower()
-    if "germany" in loc or "deutschland" in loc:
-        return "de"
-    # District-mapped cities are German for now; extend with a per-city
-    # language map if non-German cities are added to LOCATION_DISTRICTS.
-    for city in LOCATION_DISTRICTS:
-        if city in loc:
+    """ISO 639-1 language for the location; 'en' fallback. See geo.py."""
+    lang = geo.location_language(location)
+    if lang == "en":
+        # District-mapped cities keep their previous behavior (Berlin is
+        # German even when typed without a country).
+        city = geo.parse_location(location)[0].lower()
+        if city in LOCATION_DISTRICTS:
             return "de"
-    return "en"
+    return lang
 
 
 def _translate_niche(niche, lang):
     """Translate common niche words; falls back to the English niche."""
-    mapping = NICHE_TRANSLATIONS.get(lang or "en") or {}
-    out = niche or ""
-    for src in sorted(mapping, key=len, reverse=True):
-        out = re.sub(re.escape(src), mapping[src], out, flags=re.IGNORECASE)
-    return out
+    return geo.translate_niche(niche, lang)
 
 
 def build_discovery_queries(niche, location):
@@ -257,17 +246,20 @@ def _is_generic_name(name, niche, location):
     return bool(nwords) and nwords <= qwords
 
 
-def discovery_verdict(name, url, niche="", location=""):
+def discovery_verdict(name, url, niche="", location="", allow_no_url=False):
     """Keep or drop one discovery result.
 
     Returns (keep, reason): reason is "" when the result is kept, else a
     short explanation that is written to the logs so drops stay debuggable.
+    When allow_no_url is True (OSM results), a missing URL skips the
+    domain checks but the name checks (listicle / generic-name) still run,
+    so real named businesses are kept instead of being junked.
     """
     from urllib.parse import urlparse
     dom = urlparse(url or "").netloc.lower()
-    if not dom:
+    if not dom and not allow_no_url:
         return False, "no domain in URL"
-    if is_aggregator_domain(dom):
+    if dom and is_aggregator_domain(dom):
         return False, f"aggregator/directory/social domain ({dom})"
     title = (name or "").strip()
     if title:
@@ -308,13 +300,77 @@ def _lead_count(cid):
 
 # ---------------- discover ----------------
 
-def _discover(camp):
-    """Add new leads from web search, one rotated query per tick.
+def _discover_osm(camp, niche, location):
+    """One OSM tag-group per tick (real, mapped businesses, no API key).
 
-    Each tick uses the next query from build_discovery_queries(); the
-    rotation index is persisted in the campaign cursor. After a full
-    rotation with zero new leads, discovery is exhausted and the pipeline
-    moves on. Returns next stage or None (stay in discover).
+    Returns the number of new leads added. 0 means OSM is exhausted,
+    unmapped for this niche, or failed this tick -> the caller falls
+    through to web search. OSM failures never stall the campaign.
+    Research: docs/discovery-research.md.
+    """
+    import osm_discovery as osm
+    cid = camp["id"]
+    cur = _cursor(camp)
+    ostate = cur.get("osm") or {}
+    if ostate.get("exhausted"):
+        return 0
+    lat, lon = ostate.get("lat"), ostate.get("lon")
+    if lat is None or lon is None:
+        try:
+            lat, lon = osm.geocode(location)  # once per campaign; cached below
+        except Exception as e:
+            log.warning("osm: geocoding failed for %r: %s", location, str(e)[:120])
+            return 0
+        if lat is None:
+            log.warning("osm: geocoding failed for %r; web search covers this tick", location)
+            return 0
+        ostate["lat"], ostate["lon"] = lat, lon
+    try:
+        leads, nxt, exhausted = osm.discover(
+            niche, location, lat=lat, lon=lon, group_index=int(ostate.get("gi") or 0))
+    except Exception as e:
+        log.warning("osm discover failed: %s", str(e)[:120])
+        return 0
+    ostate["gi"] = nxt
+    if exhausted:
+        ostate["exhausted"] = True
+    cur["osm"] = ostate
+    _save_cursor(cid, cur)
+    added = 0
+    for lead in leads[:DISCOVER_PER_TICK]:
+        name = (lead.get("business_name") or "").strip()
+        site = (lead.get("website") or "").strip()
+        keep, reason = discovery_verdict(name, site, niche, location, allow_no_url=True)
+        if not keep:
+            log_skipped(site or "(osm, no website)", name, reason)
+            continue
+        dup = lq.find_duplicate_lead(cid, name, site)
+        if dup:
+            if lq.merge_lead_fields(dup["id"], name=name, address=lead.get("address", ""),
+                                    phone=lead.get("phone", ""), website=site):
+                log.info("osm merged into lead %s: %s", dup["id"], name)
+            continue
+        db.w(
+            """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
+               website, email, rating, review_count, category, source, notes, fit, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (camp["user_id"], cid, name, lead.get("address", ""), lead.get("phone", ""),
+             site, "", "", "", niche, "osm", lead.get("notes", "osm discovery"),
+             lq.detect_fit(name, niche), time.time()))
+        added += 1
+    return added
+
+
+def _discover(camp):
+    """Add new leads: OSM first, web search second, one step per tick.
+
+    Each tick tries one OSM tag-group (real mapped businesses); when that
+    yields new leads the tick ends. When OSM yields nothing, is exhausted,
+    is unmapped for the niche, or errors, the tick falls through to the
+    rotated localized web-search query. The rotation index is persisted in
+    the campaign cursor. After a full rotation with zero new leads,
+    discovery is exhausted and the pipeline moves on. Returns next stage
+    or None (stay in discover).
     """
     from scrapers import websearch
     from urllib.parse import urlparse
@@ -326,6 +382,10 @@ def _discover(camp):
     target = camp.get("pipeline_target_leads") or 50
     if _lead_count(cid) >= target:
         return "enrich"
+    if _discover_osm(camp, niche, location):
+        if _lead_count(cid) >= target:
+            return "enrich"
+        return None
     queries = build_discovery_queries(niche, location)
     if not queries:
         return None
