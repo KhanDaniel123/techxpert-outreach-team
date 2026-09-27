@@ -259,6 +259,9 @@ def _own_account(aid):
 
 @app.route("/account/<int:aid>/pause", methods=["POST"])
 def account_pause(aid):
+    r = require_login()
+    if r:
+        return r
     if _own_account(aid):
         db.w("UPDATE sender_accounts SET status='paused' WHERE id=?", (aid,))
     return redirect(url_for("accounts"))
@@ -266,6 +269,9 @@ def account_pause(aid):
 
 @app.route("/account/<int:aid>/resume", methods=["POST"])
 def account_resume(aid):
+    r = require_login()
+    if r:
+        return r
     if _own_account(aid):
         db.w("UPDATE sender_accounts SET status='active' WHERE id=?", (aid,))
     return redirect(url_for("accounts"))
@@ -273,6 +279,9 @@ def account_resume(aid):
 
 @app.route("/account/<int:aid>/cap", methods=["POST"])
 def account_cap(aid):
+    r = require_login()
+    if r:
+        return r
     if _own_account(aid):
         try:
             cap = max(1, min(500, int(request.form.get("daily_cap", 30))))
@@ -419,8 +428,9 @@ def campaign_import(cid):
     if not _own_campaign(cid):
         return "Campaign not found", 404
     f = request.files.get("csvfile")
-    if not f:
-        return "No file", 400
+    if not f or not f.filename:
+        return ("Choose a CSV file first, then click Import. "
+                "No file was uploaded, so nothing was imported."), 400
     n, errors = leadmod.import_csv(uid(), cid, f.stream)
     return render_template("message.html", title="CSV import",
                            message=f"Imported {n} leads." + (f" Errors: {'; '.join(errors[:5])}" if errors else ""),
@@ -565,6 +575,9 @@ def campaign_pipeline_pause(cid):
 
 @app.route("/job/<int:jid>/status")
 def job_status(jid):
+    r = require_login()
+    if r:
+        return r
     job = db.q("SELECT * FROM jobs WHERE id=? AND user_id=?", (jid, uid()), one=True)
     if not job:
         return jsonify({"error": "not found"}), 404
@@ -574,6 +587,9 @@ def job_status(jid):
 
 @app.route("/campaign/<int:cid>/template", methods=["POST"])
 def campaign_template(cid):
+    r = require_login()
+    if r:
+        return r
     if not _own_campaign(cid):
         return "Campaign not found", 404
     db.w("""UPDATE campaigns SET subject_tpl=?, body_tpl=?, delay_min=?, delay_max=?,
@@ -623,6 +639,9 @@ def campaign_template(cid):
 
 @app.route("/campaign/<int:cid>/preview", methods=["POST"])
 def campaign_preview(cid):
+    r = require_login()
+    if r:
+        return r
     camp = _own_campaign(cid)
     if not camp:
         return jsonify({"error": "not found"}), 404
