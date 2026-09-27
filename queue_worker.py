@@ -33,10 +33,15 @@ MAX_RUN_SECONDS = 50  # stay well under serverless time limits
 def enqueue_campaign(user_id, campaign_id):
     """Queue every selected lead with an email for a campaign.
 
-    Unsubscribed leads are never queued (same as the reply/bounce guards)."""
+    Unsubscribed, replied, and bounced leads are never queued (same as the
+    reply/bounce guards in the pipeline and sequence_gate)."""
     leads = db.q(
-        "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>'' AND unsubscribed=0",
-        (campaign_id,))
+        """SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>''
+           AND unsubscribed=0 AND replied=0
+           AND NOT EXISTS (SELECT 1 FROM send_log b
+                           WHERE b.campaign_id=? AND b.lead_id=leads.id
+                           AND b.status='bounced')""",
+        (campaign_id, campaign_id))
     now = time.time()
     n = 0
     for lead in leads:
@@ -148,6 +153,16 @@ def _process_campaign(camp, now_ts, send_fn=None):
             outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
                              "to": lead["email"], "step": step,
                              "detail": "Lead unsubscribed; never mailed again."})
+            continue
+        if lead.get("replied"):
+            # Belt-and-suspenders: a lead that replied after being queued is
+            # dropped here too; the whole sequence stops, never mailed again.
+            step = item["step"] or 0
+            db.w("UPDATE send_queue SET status='failed', last_error=? WHERE id=?",
+                 ("Lead replied; sequence stopped.", item["id"]))
+            outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
+                             "to": lead["email"], "step": step,
+                             "detail": "Lead replied; sequence stopped."})
             continue
         step = item["step"] or 0
         if not sender.in_window(camp, datetime.now()):

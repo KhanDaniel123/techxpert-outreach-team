@@ -215,6 +215,16 @@ LISTICLE_RES = tuple(re.compile(p, re.I) for p in LISTICLE_PATTERNS)
 
 _WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
 
+# Words that carry no business identity on their own. Stopwords (English +
+# German, since discovery queries can be German) plus industry-generic
+# filler: a name that says nothing beyond the niche + location is a
+# placeholder, e.g. "Berlin Gyms and Fitness" or "Berlin Fitness Club".
+_FILLER_WORDS = frozenset(
+    "and und the der die das of von in im for fuer für &".split())
+_INDUSTRY_FILLER_WORDS = frozenset(
+    "fitness fitnessstudio fitnessstudios gym gyms studio studios "
+    "center centre centers centres club clubs".split())
+
 
 def _is_generic_name(name, niche, location):
     """True for placeholder names like "Berlin10" or "Berlin Gyms and Fitness"."""
@@ -227,9 +237,15 @@ def _is_generic_name(name, niche, location):
         loc_words = set(_WORD_RE.findall((location or "").lower()))
         if m.group(1) in loc_words:
             return True
-    # name made only of niche/location words, e.g. "Berlin Gyms and Fitness"
-    qwords = set(_WORD_RE.findall(f"{niche or ''} {location or ''}".lower()))
-    nwords = set(_WORD_RE.findall(n))
+    # name made only of niche/location words (plus filler words), e.g.
+    # "Berlin Gyms and Fitness". German niche variants count too, so
+    # "Berlin Fitnessstudios" is caught the same way.
+    niche_words = set(_WORD_RE.findall((niche or "").lower()))
+    niche_words |= set(_WORD_RE.findall(
+        _translate_niche(niche or "", _location_lang(location)).lower()))
+    qwords = (set(_WORD_RE.findall((location or "").lower()))
+              | niche_words | _INDUSTRY_FILLER_WORDS)
+    nwords = set(_WORD_RE.findall(n)) - _FILLER_WORDS
     return bool(nwords) and nwords <= qwords
 
 

@@ -337,6 +337,9 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
     if lead.get("unsubscribed"):
         return {"ok": False, "reason": "unsubscribed",
                 "detail": "Lead unsubscribed; never mailed again."}
+    if lead.get("replied"):
+        return {"ok": False, "reason": "replied",
+                "detail": "Lead replied; sequence stopped."}
 
     # Compliance footer on every outgoing campaign email and follow-up:
     # company name + physical address + one-click unsubscribe link.
