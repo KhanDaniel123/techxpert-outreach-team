@@ -152,6 +152,20 @@ def _compose_address(tags):
     return ", ".join(p for p in (street, postcode, city) if p)
 
 
+# Integer-overflow sentinels sometimes found in OSM phone tags from bad
+# imports (e.g. a phone of exactly 2^31-1). Never a real dialable number:
+# drop rather than store.
+_OVERFLOW_PHONES = frozenset({"2147483647", "2147483648", "4294967295"})
+
+
+def _clean_phone(raw):
+    phone = (raw or "").strip()
+    if phone and phone.replace(" ", "").replace("-", "").isdigit():
+        if phone.replace(" ", "").replace("-", "") in _OVERFLOW_PHONES:
+            return ""
+    return phone
+
+
 def parse_element(el):
     """One Overpass element -> lead dict, or None when unusable.
 
@@ -164,7 +178,7 @@ def parse_element(el):
     if not name:
         return None
     website = (tags.get("website") or tags.get("contact:website") or "").strip()
-    phone = (tags.get("phone") or tags.get("contact:phone") or "").strip()
+    phone = _clean_phone(tags.get("phone") or tags.get("contact:phone"))
     if not website and not phone:
         return None
     if website and not website.startswith("http"):

@@ -172,6 +172,11 @@ AGGREGATOR_DOMAINS = (
     "reddit.com", "pinterest.com", "mysanantonio.com", "forbes.com",
     "bobvila.com", "thisoldhouse.com", "familyhandyman.com",
     "duckduckgo.com",
+    # German review/directory/comparison portals (seen returning junk in a
+    # real Berlin shakedown run): review aggregator, city directory,
+    # listicle site, gym comparison portal.
+    "werkenntdenbesten.de", "citiesinsider.com", "besteberlin.com",
+    "gymfind.de",
 )
 
 # Brands matched as a domain part (catches country TLDs like
@@ -197,7 +202,8 @@ def is_aggregator_domain(netloc):
 
 
 # Titles that read like a ranking article or guide rather than one
-# business homepage.
+# business homepage. English patterns first, then German equivalents:
+# "Die 10 besten Fitnessstudios", "Beste ... in Berlin", "im Vergleich".
 LISTICLE_PATTERNS = (
     r"\b\d+\s+(best|top)\b",         # "11 Top Locations", "10 Best Gyms"
     r"\b(best|top)\s+\d+\b",         # "Best 10", "Top 11"
@@ -207,6 +213,10 @@ LISTICLE_PATTERNS = (
     r"\b(ultimate\s+)?guide\b",      # "guide", "Ultimate Guide"
     r"\brankings?\b",
     r"\breviews?\b",
+    r"\b\d+\s+besten\b",             # "Die 10 besten Fitnessstudios"
+    r"\bbeste[nsr]?\b.{0,60}\bin\b", # "Beste Fitnessstudios in Berlin"
+    r"\bim vergleich\b",             # "59 Studios im Vergleich"
+    r"\bvergleich\b",                # "Vergleich" (comparison)
 )
 LISTICLE_RES = tuple(re.compile(p, re.I) for p in LISTICLE_PATTERNS)
 

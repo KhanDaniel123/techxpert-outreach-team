@@ -1344,10 +1344,29 @@ check("real gym domain passes domain check",
 for _title in ("Best Gym in Berlin: 11 Top Locations for Your Training",
                "Best Gyms in Berlin (2026)",
                "Top 10 Gyms in Berlin",
-               "The 15 Best Fitness Studios in Berlin - Ultimate Guide"):
+               "The 15 Best Fitness Studios in Berlin - Ultimate Guide",
+               # German equivalents (caught in a real Berlin shakedown run)
+               "Die 10 besten Fitnessstudios in Berlin",
+               "Beste Fitnessstudios in Berlin & der Naehe",
+               "Fitnessstudios Berlin - 59 Studios im Vergleich",
+               "Exklusive Fitnessstudios im Vergleich"):
     _keep, _reason = pipelinemod.discovery_verdict(
         _title, "https://example-blog.com/best-gyms-berlin", NICHE, LOC)
     check(f"listicle skipped: {_title[:40]}", not _keep and "listicle" in _reason)
+
+# German aggregator / directory / comparison domains are skipped
+for _dom in ("https://www.werkenntdenbesten.de/detail/xyz",
+             "https://citiesinsider.com/berlin/gyms",
+             "https://www.besteberlin.com/best-gyms",
+             "https://gymfind.de/berlin"):
+    _keep, _reason = pipelinemod.discovery_verdict("Some Gym", _dom, NICHE, LOC)
+    check(f"german aggregator skipped: {_dom}", not _keep and "aggregator" in _reason)
+
+# a real German gym name still passes
+check("real german gym name passes",
+      pipelinemod.discovery_verdict("Kieser Training",
+                                   "https://www.kieser-training.de/studios/berlin/",
+                                   NICHE, LOC)[0])
 
 # generic placeholder names are skipped
 _keep, _reason = pipelinemod.discovery_verdict(
@@ -2140,6 +2159,17 @@ _cur = json.loads(db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?",
                        (campO,), one=True)["pipeline_cursor"])
 check("osm: cursor caches coords + marks exhausted",
       _cur["osm"]["lat"] == 52.5 and _cur["osm"]["exhausted"] is True)
+
+# Integer-overflow phone artifacts from bad OSM imports are dropped, real
+# phones are kept verbatim.
+_overflow_el = {"tags": {"name": "Bad Phone Gym", "phone": "2147483647",
+                         "website": "https://badphone.example"}}
+_parsed = osmmod.parse_element(_overflow_el)
+check("osm: int32-overflow phone dropped", _parsed is not None and _parsed["phone"] == "")
+_good_el = {"tags": {"name": "Good Phone Gym", "phone": "+49 30 41718917",
+                     "website": "https://goodphone.example"}}
+check("osm: real phone kept",
+      osmmod.parse_element(_good_el)["phone"] == "+49 30 41718917")
 
 # OSM/web dedup merge: same business via web search merges, no new row.
 with mock.patch.object(pipelinemod, "_discover_osm", return_value=0), \
