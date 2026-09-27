@@ -37,6 +37,15 @@ def uid():
     return session.get("user_id")
 
 
+def _safe_int(v, default):
+    """Parse a form number, falling back to the default instead of 500ing
+    when the user types text into a number field."""
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def current_user():
     return db.get_user(uid()) if uid() else None
 
@@ -340,8 +349,8 @@ def campaign_new():
              request.form.get("subject_tpl", "Quick question for {business_name}"),
              request.form.get("body_tpl",
                               "Hi {business_name} team,\n\n{Quick question|Had a quick question} about how you handle {niche} jobs in {location}.\n\nWorth a 10-minute chat?\n\nBest"),
-             int(request.form.get("delay_min", 60) or 60),
-             int(request.form.get("delay_max", 180) or 180),
+             _safe_int(request.form.get("delay_min") or 60, 60),
+             _safe_int(request.form.get("delay_max") or 180, 180),
              request.form.get("window_start", "09:00"), request.form.get("window_end", "17:00"),
              1 if request.form.get("dry_run") else 0, "draft", time.time()))
         # Seed the 5 default follow-up steps so the sequence works out of the box.
@@ -595,8 +604,8 @@ def campaign_template(cid):
     db.w("""UPDATE campaigns SET subject_tpl=?, body_tpl=?, delay_min=?, delay_max=?,
             window_start=?, window_end=?, dry_run=? WHERE id=? AND user_id=?""",
          (request.form.get("subject_tpl", ""), request.form.get("body_tpl", ""),
-          int(request.form.get("delay_min", 60) or 60),
-          int(request.form.get("delay_max", 180) or 180),
+          _safe_int(request.form.get("delay_min") or 60, 60),
+          _safe_int(request.form.get("delay_max") or 180, 180),
           request.form.get("window_start", "09:00"), request.form.get("window_end", "17:00"),
           1 if request.form.get("dry_run") else 0, cid, uid()))
     # Follow-up sequence settings. Only touch follow-up rows when the form
