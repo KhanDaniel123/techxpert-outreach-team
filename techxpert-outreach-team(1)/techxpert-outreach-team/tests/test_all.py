@@ -1300,6 +1300,65 @@ finally:
 check("gemini model default is flash, env-overridable",
       configmod.GEMINI_MODEL == "gemini-2.0-flash")
 
+# ================= 12. Discovery filter (aggregators/listicles/junk) =================
+NICHE = "Gyms and fitness centers"
+LOC = "Berlin, Germany"
+
+# aggregator / directory / social domains are skipped
+for _dom in ("https://www.tripadvisor.com/Attraction_Review-xyz",
+             "https://www.tripadvisor.de/Restaurant_Review-xyz",
+             "https://www.yelp.com/biz/some-gym",
+             "https://www.google.com/maps/place/xyz",
+             "https://www.facebook.com/somegym",
+             "https://www.instagram.com/somegym",
+             "https://www.linkedin.com/company/somegym",
+             "https://www.youtube.com/watch?v=abc",
+             "https://x.com/somegym",
+             "https://www.tiktok.com/@somegym",
+             "https://www.foursquare.com/v/xyz",
+             "https://www.groupon.com/deals/xyz",
+             "https://www.trustpilot.com/review/xyz"):
+    _keep, _reason = pipelinemod.discovery_verdict("Some Gym", _dom, NICHE, LOC)
+    check(f"aggregator skipped: {_dom}", not _keep and "aggregator" in _reason)
+
+# innocent domains are not caught by the aggregator list
+check("box.com is not an aggregator (x.com substring guard)",
+      pipelinemod.discovery_verdict("Box Gym", "https://box.com/", NICHE, LOC)[0])
+check("real gym domain passes domain check",
+      pipelinemod.discovery_verdict("McFIT Berlin Mitte",
+                                   "https://www.mcfit.com/de/studios/berlin-mitte/",
+                                   NICHE, LOC)[0])
+
+# listicle / guide titles are skipped
+for _title in ("Best Gym in Berlin: 11 Top Locations for Your Training",
+               "Best Gyms in Berlin (2026)",
+               "Top 10 Gyms in Berlin",
+               "The 15 Best Fitness Studios in Berlin - Ultimate Guide"):
+    _keep, _reason = pipelinemod.discovery_verdict(
+        _title, "https://example-blog.com/best-gyms-berlin", NICHE, LOC)
+    check(f"listicle skipped: {_title[:40]}", not _keep and "listicle" in _reason)
+
+# generic placeholder names are skipped
+_keep, _reason = pipelinemod.discovery_verdict(
+    "Berlin10", "https://berlin10.example.com/", NICHE, LOC)
+check("city+number name skipped (Berlin10)", not _keep and "generic" in _reason)
+_keep, _reason = pipelinemod.discovery_verdict(
+    "Berlin Gyms and Fitness", "https://example.com/", NICHE, LOC)
+check("query-words-only name skipped", not _keep and "generic" in _reason)
+
+# real business names pass
+for _name in ("McFIT Berlin Mitte", "FitX Kreuzberg", "John Reed Fitness"):
+    _keep, _reason = pipelinemod.discovery_verdict(
+        _name, "https://www.mcfit.com/", NICHE, LOC)
+    check(f"real business passes: {_name}", _keep and _reason == "")
+
+# empty name falls back to domain later, so it passes the filter
+check("empty name passes filter",
+      pipelinemod.discovery_verdict("", "https://some-gym-berlin.de/", NICHE, LOC)[0])
+# empty URL is dropped
+check("empty URL dropped",
+      not pipelinemod.discovery_verdict("Some Gym", "", NICHE, LOC)[0])
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:
     print("FAILED:", failed)

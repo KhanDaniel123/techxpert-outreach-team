@@ -26,9 +26,13 @@ anyone. Never guesses emails: only publicly found, validated addresses
 enter the send queue.
 """
 import json
+import logging
+import re
 import time
 
 import db
+
+log = logging.getLogger(__name__)
 
 DISCOVER_PER_TICK = 5   # new business domains identified per tick
 ENRICH_PER_TICK = 3     # websites crawled for emails per tick
@@ -61,6 +65,115 @@ QUERY_VARIANTS = [
 # acceptable for cold outreach; "unknown" is held back, "invalid" and
 # "none" never mail.
 SENDABLE_VERDICTS = ("valid", "risky")
+
+
+# ---------------------------------------------------------------------------
+# Discovery filter: keep real businesses, drop aggregators/listicles/junk.
+# Shared by the Full Autopilot pipeline (_discover) and the manual
+# web-search job (jobs._websearch_chunk).
+# ---------------------------------------------------------------------------
+
+# Domains that never belong to a single real business: aggregators,
+# directories, review sites, social networks, search engines. Easy to
+# extend: just add the site's base domain, e.g. "sometravelsite.com".
+# Matching is by domain part, so "www.tripadvisor.de" and "m.yelp.com"
+# are caught too.
+AGGREGATOR_DOMAINS = (
+    "tripadvisor.com", "yelp.com", "google.com", "facebook.com",
+    "instagram.com", "linkedin.com", "youtube.com", "youtu.be",
+    "twitter.com", "x.com", "tiktok.com", "foursquare.com",
+    "groupon.com", "trustpilot.com", "angi.com", "thumbtack.com",
+    "homeadvisor.com", "yellowpages.com", "bbb.org", "mapquest.com",
+    "manta.com", "superpages.com", "dexknows.com", "houzz.com",
+    "porch.com", "expertise.com", "consumeraffairs.com",
+    "chamberofcommerce.com", "wikipedia.org", "local.yahoo.com",
+    "reddit.com", "pinterest.com", "mysanantonio.com", "forbes.com",
+    "bobvila.com", "thisoldhouse.com", "familyhandyman.com",
+    "duckduckgo.com",
+)
+
+# Brands matched as a domain part (catches country TLDs like
+# tripadvisor.de). Short brands (<=2 chars, e.g. "x") are excluded here
+# so innocent domains like box.com never match; they are still caught by
+# the exact/suffix check in is_aggregator_domain.
+_AGGREGATOR_BRANDS = frozenset(
+    p.split(".")[0] for p in AGGREGATOR_DOMAINS if len(p.split(".")[0]) > 2
+)
+
+
+def is_aggregator_domain(netloc):
+    """True when the domain is an aggregator/directory/social/search site."""
+    d = (netloc or "").lower().strip()
+    if not d:
+        return True
+    host = d.split(":")[0].lstrip(".")
+    parts = host.split(".")
+    if any(part in _AGGREGATOR_BRANDS for part in parts):
+        return True
+    return any(host == p or host.endswith("." + p)
+               for p in AGGREGATOR_DOMAINS)
+
+
+# Titles that read like a ranking article or guide rather than one
+# business homepage.
+LISTICLE_PATTERNS = (
+    r"\b\d+\s+(best|top)\b",         # "11 Top Locations", "10 Best Gyms"
+    r"\b(best|top)\s+\d+\b",         # "Best 10", "Top 11"
+    r"\bbest\b.{0,60}\bin\b",        # "Best Gym in Berlin"
+    r"\btop\b.{0,60}\bin\b",         # "Top Gyms in Berlin"
+    r"\blocations?\s+for\s+your\b",  # "Locations for Your Training"
+    r"\b(ultimate\s+)?guide\b",      # "guide", "Ultimate Guide"
+    r"\brankings?\b",
+    r"\breviews?\b",
+)
+LISTICLE_RES = tuple(re.compile(p, re.I) for p in LISTICLE_PATTERNS)
+
+_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _is_generic_name(name, niche, location):
+    """True for placeholder names like "Berlin10" or "Berlin Gyms and Fitness"."""
+    n = (name or "").strip().lower()
+    if not n:
+        return False
+    # "<city><number>", e.g. Berlin10
+    m = re.match(r"^([^\W\d_]+)\s*(\d{1,4})$", n, re.UNICODE)
+    if m:
+        loc_words = set(_WORD_RE.findall((location or "").lower()))
+        if m.group(1) in loc_words:
+            return True
+    # name made only of niche/location words, e.g. "Berlin Gyms and Fitness"
+    qwords = set(_WORD_RE.findall(f"{niche or ''} {location or ''}".lower()))
+    nwords = set(_WORD_RE.findall(n))
+    return bool(nwords) and nwords <= qwords
+
+
+def discovery_verdict(name, url, niche="", location=""):
+    """Keep or drop one discovery result.
+
+    Returns (keep, reason): reason is "" when the result is kept, else a
+    short explanation that is written to the logs so drops stay debuggable.
+    """
+    from urllib.parse import urlparse
+    dom = urlparse(url or "").netloc.lower()
+    if not dom:
+        return False, "no domain in URL"
+    if is_aggregator_domain(dom):
+        return False, f"aggregator/directory/social domain ({dom})"
+    title = (name or "").strip()
+    if title:
+        for rx in LISTICLE_RES:
+            if rx.search(title):
+                return False, f"listicle/guide title ({title[:60]})"
+        if _is_generic_name(title, niche, location):
+            return False, f"generic name ({title[:60]})"
+    return True, ""
+
+
+def log_skipped(url, name, reason):
+    """One log line per dropped discovery result (visible in server logs)."""
+    log.info("discovery skipped: %s | name=%r | reason=%s",
+             url, (name or "")[:60], reason)
 
 
 def _cursor(camp):
@@ -128,10 +241,13 @@ def _discover(camp):
                 dom = urlparse(u).netloc.lower()
             except Exception:
                 continue
-            if (dom and dom not in seen_domains
-                    and websearch._is_business_domain(dom)
-                    and dom not in [d for d, _ in new_urls]):
-                new_urls.append((dom, u))
+            if not dom or dom in seen_domains or dom in [d for d, _ in new_urls]:
+                continue
+            if is_aggregator_domain(dom):
+                log_skipped(u, "", f"aggregator/directory/social domain ({dom})")
+                seen_domains.add(dom)
+                continue
+            new_urls.append((dom, u))
         if new_urls:
             cur["v"] = variant  # stay on this variant until it is exhausted
             break
@@ -150,6 +266,12 @@ def _discover(camp):
             ident = {}
         name = ((ident or {}).get("name") or "").strip()
         if name and websearch.ARTICLE_TITLE_RE.search(name):
+            log_skipped(url, name, "article/ranking title (ARTICLE_TITLE_RE)")
+            seen_domains.add(dom)
+            continue
+        keep, reason = discovery_verdict(name, url, niche, location)
+        if not keep:
+            log_skipped(url, name, reason)
             seen_domains.add(dom)
             continue
         if not name:

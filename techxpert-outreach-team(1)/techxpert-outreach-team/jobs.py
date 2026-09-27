@@ -11,6 +11,7 @@ import json
 import time
 
 import db
+import pipeline as pipelinemod
 
 WEBSEARCH_FETCH_PER_CHUNK = 3
 ENRICH_PER_CHUNK = 2          # each site fetch + email validation can take ~10-40s
@@ -80,7 +81,7 @@ def _websearch_chunk(job):
             links = websearch.ddg_links(f"{camp['niche']} {camp['location']}".strip())
         seen, urls = set(), []
         for u in links:
-            if websearch._is_business_domain(urlparse(u).netloc):
+            if not pipelinemod.is_aggregator_domain(urlparse(u).netloc):
                 dom = urlparse(u).netloc
                 if dom not in seen:
                     seen.add(dom)
@@ -94,10 +95,20 @@ def _websearch_chunk(job):
     urls, idx = p["urls"], p["idx"]
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (job["campaign_id"],), one=True)
     added = 0
+    skipped = 0
+    niche = (camp["niche"] if camp else "") or ""
+    location = (camp["location"] if camp else "") or ""
     for url in urls[idx:idx + WEBSEARCH_FETCH_PER_CHUNK]:
         ident = websearch._site_identity(url)
         name = (ident.get("name") or "").strip()
         if name and websearch.ARTICLE_TITLE_RE.search(name):
+            pipelinemod.log_skipped(url, name, "article/ranking title (ARTICLE_TITLE_RE)")
+            skipped += 1
+            continue
+        keep, reason = pipelinemod.discovery_verdict(name, url, niche, location)
+        if not keep:
+            pipelinemod.log_skipped(url, name, reason)
+            skipped += 1
             continue
         if not name:
             name = urlparse(url).netloc.replace("www.", "")
@@ -117,7 +128,8 @@ def _websearch_chunk(job):
     p["idx"] = idx
     if idx >= len(urls):
         _save(job["id"], p, status="done", done=len(urls),
-              result=f"web search '{p.get('query', '')}': {len(urls)} domains checked, {added} new leads this run")
+              result=f"web search '{p.get('query', '')}': {len(urls)} domains checked, "
+                     f"{added} new leads this run, {skipped} junk results skipped")
     else:
         _save(job["id"], p, done=min(idx, len(urls)))
 

@@ -3,7 +3,7 @@
 Run: `python3 tests/test_all.py` (from the project root)
 Date: 2026-09-28. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**189 passed, 0 failed.**
+**215 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -129,3 +129,19 @@ to a terminal done stage that never restarts. tick_all skips paused
 campaigns and advances one stage per enabled campaign per tick.
 `process_all` runs the pipeline tick inside the scheduler alongside the
 reply scan, job chunk, and sends.
+
+## Discovery filter (26)
+Shared filter in `pipeline.py`, reused by the manual web-search job in
+`jobs.py`. `discovery_verdict(name, url, niche, location)` returns
+(keep, reason); every drop is written to the server logs via
+`log_skipped` and the manual job reports its junk-skip count in its
+result line. `AGGREGATOR_DOMAINS` (easy to extend) drops aggregator /
+directory / social / search domains by domain part, so tripadvisor.de,
+m.yelp.com etc. are caught too; the `x.com` entry cannot false-positive
+on domains like box.com. `LISTICLE_PATTERNS` drops ranking/guide titles
+("11 Top Locations for Your Training", "Best Gyms in Berlin (2026)",
+"Top 10 Gyms in Berlin"). Placeholder names are dropped: "<city><number>"
+("Berlin10") and names made only of niche/location words ("Berlin Gyms
+and Fitness"). Real businesses (McFIT Berlin Mitte, FitX Kreuzberg, John
+Reed Fitness) pass; empty names still fall back to the domain; empty URLs
+are dropped.
