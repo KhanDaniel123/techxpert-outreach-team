@@ -1,9 +1,9 @@
 # Test report - TechXpert Outreach v2 (Google-free)
 
-Run: `/tmp/v2venv/bin/python tests/test_all.py`
+Run: `~/workspace/v2test-venv/bin/python tests/test_all.py`
 Date: 2026-09-27. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**94 passed, 0 failed.**
+**147 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -39,11 +39,26 @@ previous step blocks it; disabled follow-ups don't chain; chain stops at the
 configured count; campaign page shows Replied / F1-queued per-lead status;
 logs page shows Initial/F1 step pills.
 
-## Reply & bounce detection (4)
-`scan_replies` (mocked IMAP) returns the replier's address, skips
-mailer-daemon and the account's own address; `mark_replies` is
-case-insensitive and user-scoped; `scan_bounces` extracts the failed
-recipient; IMAP failures degrade to `[]` (never raise).
+## Reply & bounce detection (6)
+`scan_replies` (mocked IMAP) returns dicts `{address, snippet, date}` for each
+replier, skipping mailer-daemon and the account's own address, newest message
+wins per address; `mark_replies` accepts the rich data (plain strings still
+work), is case-insensitive and user-scoped, returns only newly-marked leads
+with full context (business, email, campaign id/name, snippet, date), and
+returns `[]` on repeat scans; `scan_bounces` extracts the failed recipient;
+IMAP failures degrade to `[]` (never raise).
+
+## Reply notifications + handled pipeline (15)
+`notify_replies` inserts one `notifications` row per newly-replied lead
+(deduped: no duplicates on repeat scans) and emails the user's login address
+from their sender account with subject `Reply from {business} ({campaign})`,
+the reply snippet, and a campaign link; with no sender account the
+notification is still stored and the email is skipped gracefully. Dashboard
+shows a "Replied leads" hot list (business, email, campaign, snippet, time)
+with Open-campaign and Mark-handled actions; `handled=1` hides a lead from
+the list; header bell shows the unread count and opening `/notifications`
+marks everything read; the cron tick notifies through the same path without
+duplicates.
 
 ## Preserved engine (20) + personalized_line (11)
 Spintax (incl. nested), template variables, round-robin rotation, caps/paused
@@ -61,5 +76,24 @@ import reads the column, manual add stores it, DB-row rendering works.
 
 ## Not covered by automated tests (do live after deploy)
 One supervised real Gmail send (App Password login from Vercel's network),
-one live IMAP reply/bounce scan, and the external 10-minute cron actually
-triggering `/api/process-queue`.
+one live IMAP reply/bounce scan, the external 10-minute cron actually
+triggering `/api/process-queue`, and one real OpenAI generation (key set)
+to confirm grounding quality and cost per lead.
+
+## Autopilot AI SDR mode (38)
+Gap analyzer: no-website / unreachable / full-site / bare-site findings are
+pure observations; prompt contains the grounding rules (only observed facts,
+never invent metrics, 120/60 word caps, 3 different follow-up angles);
+findings + business context passed to the model verbatim; AI content
+generated once and cached (second call makes zero API calls); skip when no
+website and no business info (falls back to template, no AI call);
+`_templates_for` uses AI email / AI follow-ups / cycles fu3 with a
+"circling back" prefix beyond step 3; until-reply mode chains steps 1-4 and
+never exceeds max_touches (5 sends, no step 5); reply stops the until-reply
+sequence; autopilot without AI content falls back to the normal template;
+settings saved and clamped via the template route (max_touches 1-20, bogus
+mode resets to fixed); campaign page shows the toggle, per-lead cost, and
+"AI written" status; settings page shows Enabled/Disabled; autopilot job
+runs chunked (init, one lead, done); without a key the toggle is forced off,
+the campaign page explains AI is off, the autopilot route refuses, and
+normal templates still send. Avg cost per lead computed from stored tokens.

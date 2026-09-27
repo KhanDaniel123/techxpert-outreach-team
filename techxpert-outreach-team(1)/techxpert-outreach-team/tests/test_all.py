@@ -412,12 +412,20 @@ FakeIMAP.msgs = [
     b"From: send1@gmail.com\r\nSubject: sent mail\r\n\r\n",
 ]
 with mock.patch("imaplib.IMAP4_SSL", FakeIMAP):
-    addrs = smtp_mail.scan_replies(acct_row)
+    replies = smtp_mail.scan_replies(acct_row)
 check("scan_replies finds replier, skips daemon + self",
-      addrs == ["chain5@example.com"], str(addrs))
-n = sender.mark_replies(u1["id"], ["CHAIN5@EXAMPLE.COM", "nope@example.com"])
-check("mark_replies is case-insensitive + user-scoped",
-      n == 1 and db.q("SELECT replied FROM leads WHERE id=?", (lid5,), one=True)["replied"] == 1)
+      [r["address"] for r in replies] == ["chain5@example.com"], str(replies))
+check("scan_replies carries snippet + date",
+      replies and "interested!" in replies[0]["snippet"] and "date" in replies[0])
+new = sender.mark_replies(u1["id"], [{"address": "CHAIN5@EXAMPLE.COM", "snippet": "s", "date": None},
+                                     "nope@example.com"])
+check("mark_replies is case-insensitive + user-scoped, returns new leads",
+      len(new) == 1 and new[0]["lead_id"] == lid5
+      and new[0]["email"] == "chain5@example.com"
+      and new[0]["campaign_id"] == cc5 and new[0]["campaign_name"]
+      and db.q("SELECT replied FROM leads WHERE id=?", (lid5,), one=True)["replied"] == 1)
+check("repeat mark_replies returns nothing (no double count)",
+      sender.mark_replies(u1["id"], [{"address": "chain5@example.com", "snippet": "s", "date": None}]) == [])
 
 # bounce scan still parses
 FakeIMAP.msgs = [(
@@ -590,6 +598,400 @@ with mock.patch("enrich.enrich_website", return_value={"emails": ["e@x.com"], "h
     jobsmod.process_one_job_chunk()
     job = db.q("SELECT * FROM jobs WHERE id=?", (jid,), one=True)
 check("enrich job chunk completes (mocked)", job["status"] == "done")
+
+# ================= 8. reply notifications =================
+u8 = make_user("u8@example.com")
+c8 = login_client("u8@example.com")
+a8 = add_account(u8["id"], "send8@gmail.com")
+cc8 = make_campaign(c8, "NotifyCamp", dry_run=1)
+lid8 = add_lead(cc8, u8["id"], "reply8@example.com", "Reply8 Biz")
+acct8 = db.q("SELECT * FROM sender_accounts WHERE id=?", (a8,), one=True)
+
+FakeIMAP.msgs = [
+    b"From: reply8@example.com\r\nDate: Sat, 27 Sep 2026 09:00:00 +0000\r\n"
+    b"Subject: Re: hi\r\n\r\nSounds great, let's talk Tuesday morning!",
+]
+with mock.patch("imaplib.IMAP4_SSL", FakeIMAP):
+    replies8 = smtp_mail.scan_replies(acct8)
+check("notification flow: scan returns snippet + parsed date",
+      len(replies8) == 1 and "Tuesday morning" in replies8[0]["snippet"]
+      and replies8[0]["date"] is not None)
+
+new8 = sender.mark_replies(u8["id"], replies8)
+check("mark_replies returns full lead context",
+      len(new8) == 1 and new8[0]["business_name"] == "Reply8 Biz"
+      and new8[0]["campaign_name"] == "NotifyCamp"
+      and "Tuesday morning" in new8[0]["snippet"])
+
+sent_notes = []
+with mock.patch.object(smtp_mail, "send_message",
+                       side_effect=lambda a, t, s, b: sent_notes.append((a["email"], t, s, b)) or True):
+    n8 = sender.notify_replies(u8["id"], acct8, new8)
+check("notify_replies creates one notification row with snippet",
+      n8 == 1 and db.q("SELECT COUNT(*) c FROM notifications WHERE user_id=? AND kind='reply'",
+                       (u8["id"],), one=True)["c"] == 1
+      and "Tuesday morning" in db.q("SELECT snippet FROM notifications WHERE user_id=?",
+                                    (u8["id"],), one=True)["snippet"])
+check("notify email goes to the user's login email from their sender account",
+      len(sent_notes) == 1 and sent_notes[0][1] == "u8@example.com"
+      and sent_notes[0][0] == "send8@gmail.com"
+      and "Reply from Reply8 Biz" in sent_notes[0][2]
+      and "Tuesday morning" in sent_notes[0][3]
+      and "/campaign/" in sent_notes[0][3])
+
+# repeat scan: no duplicate notification, no second email
+new8b = sender.mark_replies(u8["id"], replies8)
+sent_notes.clear()
+with mock.patch.object(smtp_mail, "send_message",
+                       side_effect=lambda a, t, s, b: sent_notes.append((t, s)) or True):
+    n8b = sender.notify_replies(u8["id"], acct8, new8b)
+check("no duplicate notifications or emails on repeat scan",
+      new8b == [] and n8b == 0 and sent_notes == []
+      and db.q("SELECT COUNT(*) c FROM notifications WHERE user_id=?",
+               (u8["id"],), one=True)["c"] == 1)
+
+# no sender account: notification stored, email skipped gracefully
+lid8b = add_lead(cc8, u8["id"], "reply8b@example.com", "Reply8b Biz")
+new8c = sender.mark_replies(u8["id"], [{"address": "reply8b@example.com", "snippet": "hi", "date": None}])
+with mock.patch.object(smtp_mail, "send_message", side_effect=AssertionError("should not send")):
+    n8c = sender.notify_replies(u8["id"], None, new8c)
+check("notification stored without sender account, email skipped",
+      n8c == 1 and db.q("SELECT COUNT(*) c FROM notifications WHERE user_id=?",
+                        (u8["id"],), one=True)["c"] == 2)
+
+# dashboard hot list: replied + unhandled shows; handled hides
+r = c8.get("/dashboard")
+html = r.data.decode()
+check("dashboard shows replied lead hot list",
+      "<b>Reply8 Biz</b>" in html and "Tuesday morning" in html and "Mark handled" in html)
+check("header bell shows unread count", 'badge">2<' in html)
+db.w("UPDATE leads SET handled=1 WHERE id=?", (lid8,))
+r = c8.get("/dashboard")
+check("handled lead hidden from hot list", "<b>Reply8 Biz</b>" not in r.data.decode())
+r = c8.get("/notifications")
+check("notifications page renders + marks all read",
+      r.status_code == 200 and "Reply from Reply8 Biz" in r.data.decode()
+      and db.q("SELECT COUNT(*) c FROM notifications WHERE user_id=? AND read_at IS NULL",
+               (u8["id"],), one=True)["c"] == 0)
+r = c8.get("/dashboard")
+check("bell badge clears after reading", '<span class="badge">' not in r.data.decode())
+r = c8.post(f"/lead/{lid8b}/handled", follow_redirects=False)
+check("mark handled route sets flag",
+      r.status_code == 302
+      and db.q("SELECT handled FROM leads WHERE id=?", (lid8b,), one=True)["handled"] == 1)
+
+# cron tick also notifies (mocked scan + mocked smtp)
+with mock.patch.object(smtp_mail, "scan_replies",
+                       return_value=[{"address": "reply8@example.com",
+                                      "snippet": "again?", "date": None}]):
+    with mock.patch.object(smtp_mail, "send_message", return_value=True):
+        marked = queue_worker._scan_replies_all()
+check("cron reply scan marks without duplicates",
+      marked == 0
+      and db.q("SELECT COUNT(*) c FROM notifications WHERE user_id=?",
+               (u8["id"],), one=True)["c"] == 2)
+
+# ================= 9. autopilot: AI SDR mode =================
+import gap_analysis
+import ai_writer
+import config as configmod
+
+FAKE_FINDINGS = ["no booking, scheduling, or quote option found on the website",
+                 "no phone number found on the website"]
+
+
+def fake_call_openai(messages):
+    sys_prompt = messages[0]["content"]
+    if "follow-up" in sys_prompt:
+        return ({"followups": [
+            {"subject": "Bump one", "body": "First bump body."},
+            {"subject": "Bump two", "body": "Second bump body."},
+            {"subject": "Bump three", "body": "Third bump body."}]},
+                {"input": 500, "output": 150})
+    return ({"subject": "AI subject plain",
+             "body": "Hi Acme team, this is the AI-written opener. Worth a 10-minute chat?"},
+            {"input": 400, "output": 120})
+
+
+def fake_analysis(*a, **k):
+    return {"findings": FAKE_FINDINGS, "reachable": True, "load_seconds": 0.5}
+
+
+# --- gap analyzer: deterministic, no network in tests ---
+r = gap_analysis.analyze_website("")
+check("gap: no website finding",
+      r["findings"] == ["the business has no website"] and not r["reachable"])
+r = gap_analysis.analyze_website("http://nowhere.invalid", fetch_fn=lambda u: "")
+check("gap: unreachable finding",
+      r["findings"] == ["the business website could not be reached"]
+      and not r["reachable"])
+rich_html = ("<html><head><title>Acme</title><meta name='viewport' content='width=device-width'>"
+             "</head><body>Contact us at hello@acme.com or (602) 555-0100. "
+             "<a href='https://instagram.com/acme'>IG</a> Read our testimonials. "
+             "<a href='/book'>Book appointment</a></body></html>")
+r = gap_analysis.analyze_website("acme.com", fetch_fn=lambda u: rich_html)
+check("gap: full site positive findings",
+      "the website lists a contact email address" in r["findings"]
+      and "the website lists a phone number" in r["findings"]
+      and "the website has a booking, scheduling, or quote option" in r["findings"]
+      and "the website shows reviews or testimonials" in r["findings"]
+      and "the website links to social media profiles" in r["findings"]
+      and "the website is set up for mobile screens" in r["findings"]
+      and r["reachable"], str(r["findings"]))
+bare_html = "<html><head><title>Bare</title></head><body><p>We do stuff.</p></body></html>"
+r = gap_analysis.analyze_website("bare.com", fetch_fn=lambda u: bare_html)
+check("gap: bare site gap findings",
+      "no contact email found on the website" in r["findings"]
+      and "no phone number found on the website" in r["findings"]
+      and "no booking, scheduling, or quote option found on the website" in r["findings"]
+      and "no reviews or testimonials found on the website" in r["findings"]
+      and "no social media links found on the website" in r["findings"]
+      and "the website has no mobile layout tag (may look broken on phones)" in r["findings"])
+
+# --- prompt grounding rules ---
+check("system prompt: only observed facts",
+      "ONLY the observed facts" in ai_writer.SYSTEM_PROMPT)
+check("system prompt: never invent metrics",
+      "Never invent metrics" in ai_writer.SYSTEM_PROMPT)
+check("system prompt: word cap", "120 words" in ai_writer.SYSTEM_PROMPT)
+check("followup prompt: grounded, 60 words, 3 angles",
+      "ONLY the observed facts" in ai_writer.FOLLOWUP_PROMPT
+      and "60 words" in ai_writer.FOLLOWUP_PROMPT
+      and "DIFFERENT angle" in ai_writer.FOLLOWUP_PROMPT)
+check("model is a cheap constant", configmod.AI_MODEL == "gpt-4o-mini")
+
+captured = {}
+
+
+def spy_call(messages):
+    captured["messages"] = messages
+    return fake_call_openai(messages)
+
+
+lead9info = {"business_name": "Acme Co", "category": "plumber",
+             "address": "Phoenix AZ", "website": "acme.com"}
+with mock.patch.object(ai_writer, "_call_openai", side_effect=spy_call):
+    subj, body, usage = ai_writer.generate_email(lead9info, {"niche": "plumber"},
+                                                 FAKE_FINDINGS)
+user_txt = captured["messages"][1]["content"]
+check("findings passed to model verbatim",
+      all(f in user_txt for f in FAKE_FINDINGS) and "Acme Co" in user_txt
+      and "plumber" in user_txt)
+check("email word cap enforced", len(body.split()) <= 120 and bool(subj))
+with mock.patch.object(ai_writer, "_call_openai", side_effect=spy_call):
+    fus, _ = ai_writer.generate_followups(lead9info, {}, FAKE_FINDINGS, body)
+check("3 follow-ups, each under 60 words",
+      len(fus) == 3 and all(len(b.split()) <= 60 for _, b in fus))
+check("cost estimate math",
+      abs(ai_writer.estimate_cost_usd(1_000_000, 1_000_000) - 0.75) < 1e-9)
+
+# --- generation + caching ---
+configmod.OPENAI_API_KEY = "test-key-123"
+ua = make_user("ua@example.com")
+ca = login_client("ua@example.com")
+add_account(ua["id"], "auto9@gmail.com")
+camp9 = make_campaign(ca, "Auto1", dry_run=0)
+db.w("UPDATE campaigns SET autopilot=1, followup_mode='until_reply', max_touches=5 WHERE id=?",
+     (camp9,))
+lid9 = add_lead(camp9, ua["id"], "auto9@example.com", "Auto Biz")
+db.w("UPDATE leads SET website='acme.com', category='plumber' WHERE id=?", (lid9,))
+camp9row = lambda: db.q("SELECT * FROM campaigns WHERE id=?", (camp9,), one=True)
+lead9row = lambda: db.q("SELECT * FROM leads WHERE id=?", (lid9,), one=True)
+with mock.patch.object(ai_writer, "_call_openai", side_effect=fake_call_openai) as m, \
+     mock.patch.object(ai_writer.gap_analysis, "analyze_website",
+                       side_effect=fake_analysis):
+    st1, _ = ai_writer.generate_and_store(lead9row(), camp9row())
+    st2, _ = ai_writer.generate_and_store(lead9row(), camp9row())
+check("ai content generated once and cached",
+      st1 == "ready" and st2 == "ready" and m.call_count == 2
+      and db.q("SELECT COUNT(*) c FROM ai_content WHERE lead_id=?",
+               (lid9,), one=True)["c"] == 1
+      and lead9row()["ai_status"] == "ready")
+avg, n = ai_writer.avg_cost_per_lead(camp9)
+check("avg cost per lead from stored tokens", n == 1 and 0 < avg < 0.01)
+
+# skip: no website and no business info -> fallback, no AI call
+lid9s = add_lead(camp9, ua["id"], "auto9s@example.com", "")
+db.w("UPDATE leads SET business_name='', category='', website='' WHERE id=?", (lid9s,))
+with mock.patch.object(ai_writer, "_call_openai", side_effect=fake_call_openai) as m2:
+    st, note = ai_writer.generate_and_store(
+        db.q("SELECT * FROM leads WHERE id=?", (lid9s,), one=True), camp9row())
+check("skip when no website and no business info",
+      st == "skipped" and m2.call_count == 0
+      and "normal template" in note
+      and db.q("SELECT ai_status FROM leads WHERE id=?",
+               (lid9s,), one=True)["ai_status"] == "skipped"
+      and db.q("SELECT id FROM ai_content WHERE lead_id=?",
+               (lid9s,), one=True) is None)
+db.w("UPDATE leads SET selected=0 WHERE id=?", (lid9s,))  # keep it out of send tests
+
+# --- sending uses AI content; until-reply chains to max_touches ---
+s0 = sender._templates_for(camp9row(), 0, lead9row())
+check("templates_for uses AI email", s0 == ("AI subject plain", body))
+s2 = sender._templates_for(camp9row(), 2, lead9row())
+check("templates_for uses AI follow-ups", s2 == ("Bump two", "Second bump body."))
+s4 = sender._templates_for(camp9row(), 4, lead9row())
+check("templates_for cycles fu3 beyond step 3",
+      s4[1].startswith("Circling back once more: ") and "Third bump body." in s4[1])
+
+
+def only(cid):
+    db.w("UPDATE campaigns SET status='stopped' WHERE user_id=? AND id<>?",
+         (ua["id"], cid))
+    db.w("UPDATE campaigns SET status='sending' WHERE id=?", (cid,))
+
+
+queue_worker.enqueue_campaign(ua["id"], camp9)
+sent9 = []
+wake(camp9)
+only(camp9)
+queue_worker.process_sends(send_fn=lambda a, t, s, b: sent9.append((t, s, b)) or True)
+check("autopilot step-0 sends AI email",
+      len(sent9) == 1 and sent9[0][1] == "AI subject plain"
+      and "AI-written opener" in sent9[0][2])
+ok_chain = True
+for st in (1, 2, 3, 4):
+    q = db.q("SELECT * FROM send_queue WHERE campaign_id=? AND lead_id=? AND step=?",
+             (camp9, lid9, st), one=True)
+    if not q:
+        ok_chain = False
+        break
+    db.w("UPDATE send_queue SET scheduled_at=? WHERE id=?", (time.time() - 1, q["id"]))
+    wake(camp9)
+    only(camp9)
+    before = len(sent9)
+    queue_worker.process_sends(send_fn=lambda a, t, s, b: sent9.append((t, s, b)) or True)
+    if len(sent9) != before + 1:
+        ok_chain = False
+        break
+check("until-reply chains steps 1-4", ok_chain and len(sent9) == 5)
+check("step-1..3 use AI follow-ups",
+      sent9[1][1] == "Bump one" and sent9[2][1] == "Bump two"
+      and sent9[3][1] == "Bump three")
+check("step-4 cycles fu3 with prefix",
+      sent9[4][2].startswith("Circling back once more: ")
+      and "Third bump body." in sent9[4][2])
+check("never exceeds max_touches",
+      db.q("SELECT id FROM send_queue WHERE campaign_id=? AND lead_id=? AND step>=5",
+           (camp9, lid9), one=True) is None
+      and db.q("SELECT COUNT(*) c FROM send_log WHERE campaign_id=? AND lead_id=? "
+               "AND status='sent'", (camp9, lid9), one=True)["c"] == 5)
+
+# reply stops until-reply mode
+camp9b = make_campaign(ca, "Auto2", dry_run=0)
+db.w("UPDATE campaigns SET autopilot=1, followup_mode='until_reply', max_touches=7 "
+     "WHERE id=?", (camp9b,))
+lid9b = add_lead(camp9b, ua["id"], "auto9b@example.com", "Auto B")
+db.w("""INSERT INTO ai_content (lead_id, subject, body, fu1_subj, fu1_body, fu2_subj,
+        fu2_body, fu3_subj, fu3_body, findings_json, tokens_in, tokens_out, created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+     (lid9b, "S", "B", "FS1", "FB1", "FS2", "FB2", "FS3", "FB3",
+      "[]", 1, 1, time.time()))
+queue_worker.enqueue_campaign(ua["id"], camp9b)
+wake(camp9b)
+only(camp9b)
+queue_worker.process_sends(send_fn=lambda a, t, s, b: True)
+sender.mark_replies(ua["id"], ["auto9b@example.com"])
+q = db.q("SELECT * FROM send_queue WHERE campaign_id=? AND lead_id=? AND step=1",
+         (camp9b, lid9b), one=True)
+db.w("UPDATE send_queue SET scheduled_at=? WHERE id=?", (time.time() - 1, q["id"]))
+wake(camp9b)
+only(camp9b)
+queue_worker.process_sends(send_fn=lambda a, t, s, b: True)
+row = db.q("SELECT status, last_error FROM send_queue WHERE id=?", (q["id"],), one=True)
+check("reply stops until-reply sequence",
+      row["status"] == "failed" and "replied" in row["last_error"].lower())
+
+# autopilot on but no AI content -> normal template fallback
+camp9c = make_campaign(ca, "Auto3", dry_run=0)
+db.w("UPDATE campaigns SET autopilot=1 WHERE id=?", (camp9c,))
+lid9c = add_lead(camp9c, ua["id"], "auto9c@example.com", "Auto C")
+queue_worker.enqueue_campaign(ua["id"], camp9c)
+sent9c = []
+wake(camp9c)
+only(camp9c)
+queue_worker.process_sends(send_fn=lambda a, t, s, b: sent9c.append((t, s, b)) or True)
+check("autopilot falls back to template without AI content",
+      len(sent9c) == 1 and sent9c[0][1] == "Hi Auto C"
+      and sent9c[0][2].startswith("Hello Auto C,"))
+
+# --- settings saved + clamped via template route ---
+camp9e = make_campaign(ca, "Auto5", dry_run=1)
+tpl_data = {"subject_tpl": "S", "body_tpl": "B", "delay_min": 60, "delay_max": 61,
+            "window_start": "00:00", "window_end": "23:59",
+            "followups_enabled": "on", "followup_count": "5",
+            "followup_delay_hours": "40",
+            "autopilot": "on", "followup_mode": "until_reply", "max_touches": "99"}
+ca.post(f"/campaign/{camp9e}/template", data=tpl_data)
+camp = db.q("SELECT autopilot, followup_mode, max_touches FROM campaigns WHERE id=?",
+            (camp9e,), one=True)
+check("autopilot settings saved, touches clamped",
+      camp["autopilot"] == 1 and camp["followup_mode"] == "until_reply"
+      and camp["max_touches"] == 20)
+tpl_data.update({"followup_mode": "bogus", "max_touches": "0"})
+ca.post(f"/campaign/{camp9e}/template", data=tpl_data)
+camp = db.q("SELECT followup_mode, max_touches FROM campaigns WHERE id=?",
+            (camp9e,), one=True)
+check("bogus mode resets, touches floor at 1",
+      camp["followup_mode"] == "fixed" and camp["max_touches"] == 1)
+r = ca.get(f"/campaign/{camp9}")
+page = r.data.decode()
+check("campaign page: toggle + cost + AI status shown",
+      'name="autopilot"' in page and "per email" in page and "AI written" in page)
+r = ca.get("/settings")
+check("settings shows AI enabled", "Enabled" in r.data.decode())
+
+# --- autopilot job (chunked, serverless-safe) ---
+db.w("UPDATE jobs SET status='done' WHERE status='running'")
+lid9e = add_lead(camp9e, ua["id"], "auto9e@example.com", "Auto E")
+db.w("UPDATE leads SET website='acme.com' WHERE id=?", (lid9e,))
+r = ca.post(f"/campaign/{camp9e}/autopilot", follow_redirects=False)
+check("autopilot route starts job",
+      r.status_code == 302
+      and db.q("SELECT id FROM jobs WHERE campaign_id=? AND kind='autopilot' "
+               "AND status='running'", (camp9e,), one=True) is not None)
+with mock.patch.object(ai_writer, "_call_openai", side_effect=fake_call_openai), \
+     mock.patch.object(ai_writer.gap_analysis, "analyze_website",
+                       side_effect=fake_analysis):
+    jobsmod.process_one_job_chunk()  # init
+    jobsmod.process_one_job_chunk()  # one lead
+check("autopilot job writes AI content",
+      db.q("SELECT id FROM ai_content WHERE lead_id=?", (lid9e,), one=True) is not None
+      and db.q("SELECT ai_status FROM leads WHERE id=?",
+               (lid9e,), one=True)["ai_status"] == "ready")
+with mock.patch.object(ai_writer, "_call_openai", side_effect=fake_call_openai), \
+     mock.patch.object(ai_writer.gap_analysis, "analyze_website",
+                       side_effect=fake_analysis):
+    jobsmod.process_one_job_chunk()  # done
+check("autopilot job completes",
+      db.q("SELECT status FROM jobs WHERE campaign_id=? AND kind='autopilot' "
+           "ORDER BY id DESC LIMIT 1", (camp9e,), one=True)["status"] == "done")
+
+# --- no key: autopilot unavailable, normal templates keep working ---
+configmod.OPENAI_API_KEY = ""
+camp9d = make_campaign(ca, "Auto4", dry_run=1)
+tpl_nokey = dict(tpl_data, subject_tpl="Sx", autopilot="on",
+                 followup_mode="until_reply", max_touches="7")
+ca.post(f"/campaign/{camp9d}/template", data=tpl_nokey)
+camp = db.q("SELECT autopilot, followup_mode FROM campaigns WHERE id=?",
+            (camp9d,), one=True)
+check("no key: autopilot toggle forced off", camp["autopilot"] == 0)
+r = ca.get(f"/campaign/{camp9d}")
+check("campaign page explains AI is off", "AI writing is off" in r.data.decode())
+r = ca.get("/settings")
+check("settings shows AI disabled",
+      "Disabled" in r.data.decode() and "OPENAI_API_KEY" in r.data.decode())
+r = ca.post(f"/campaign/{camp9d}/autopilot")
+check("autopilot route refuses without key", "AI writing is off" in r.data.decode())
+lid9d = add_lead(camp9d, ua["id"], "auto9d@example.com", "Auto D")
+queue_worker.enqueue_campaign(ua["id"], camp9d)
+sent9d = []
+wake(camp9d)
+only(camp9d)
+queue_worker.process_sends(send_fn=lambda a, t, s, b: sent9d.append((t, s, b)) or True)
+check("no key: normal template still sends",
+      len(sent9d) == 1 and sent9d[0][1] == "Sx")
+configmod.OPENAI_API_KEY = ""
 
 # no residual Google OAuth references
 import subprocess

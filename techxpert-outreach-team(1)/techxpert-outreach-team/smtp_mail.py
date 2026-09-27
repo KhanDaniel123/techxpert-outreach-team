@@ -152,15 +152,48 @@ def scan_bounces(account, max_results=25):
     return list(set(bounced))
 
 
+def _text_snippet(msg, limit=300):
+    """First ~`limit` chars of the message's plain-text body, whitespace-collapsed."""
+    blob = ""
+    try:
+        if msg.is_multipart():
+            for part in msg.walk():
+                if part.get_content_type() == "text/plain":
+                    try:
+                        payload = part.get_payload(decode=True) or b""
+                        blob += payload.decode("utf-8", errors="ignore") + "\n"
+                    except Exception:
+                        continue
+        else:
+            payload = msg.get_payload(decode=True) or b""
+            blob = payload.decode("utf-8", errors="ignore")
+    except Exception:
+        blob = ""
+    return re.sub(r"\s+", " ", blob).strip()[:limit]
+
+
+def _msg_date(msg):
+    """Epoch seconds from the Date header, or None if unparseable."""
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(msg.get("Date", "") or "")
+        return dt.timestamp() if dt is not None else None
+    except Exception:
+        return None
+
+
 def scan_replies(account, max_messages=100):
-    """Return unique From addresses seen in recent non-bounce inbox mail.
+    """Return reply candidates as a list of dicts:
+
+        {"address": ..., "snippet": first ~300 chars of body, "date": epoch or None}
 
     Reply detection rides on this scan: any address that emailed the sender
     account (and is not a mailer-daemon or the account itself) is treated as
     a reply candidate. The caller intersects with its own lead emails before
-    marking anyone replied. Never raises - degrades to an empty list.
+    marking anyone replied. Newest message wins per address. Never raises -
+    degrades to an empty list.
     """
-    found = []
+    found = {}
     try:
         mail = imaplib.IMAP4_SSL(IMAP_HOST, IMAP_PORT, timeout=15)
         try:
@@ -171,8 +204,8 @@ def scan_replies(account, max_messages=100):
                 return []
             ids = data[0].split()
             own = (account["email"] or "").lower()
-            for num in reversed(ids[-max_messages:]):
-                typ, msg_data = mail.fetch(num, "(BODY.PEEK[HEADER.FIELDS (FROM)])")
+            for num in reversed(ids[-max_messages:]):  # newest first
+                typ, msg_data = mail.fetch(num, "(BODY.PEEK[])")
                 if typ != "OK" or not msg_data or not msg_data[0]:
                     continue
                 raw = msg_data[0][1]
@@ -184,8 +217,12 @@ def scan_replies(account, max_messages=100):
                 if "mailer-daemon" in low or "mail-daemon" in low:
                     continue
                 for addr in set(EMAIL_RE.findall(frm)):
-                    if addr.lower() != own:
-                        found.append(addr.lower())
+                    addr = addr.lower()
+                    if addr == own or addr in found:
+                        continue
+                    found[addr] = {"address": addr,
+                                   "snippet": _text_snippet(m),
+                                   "date": _msg_date(m)}
         finally:
             try:
                 mail.close()
@@ -197,4 +234,4 @@ def scan_replies(account, max_messages=100):
                 pass
     except Exception:
         return []
-    return list(set(found))
+    return list(found.values())

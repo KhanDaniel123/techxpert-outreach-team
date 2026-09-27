@@ -22,6 +22,7 @@ import smtp_mail
 import followups as followupsmod
 import queue_worker
 import jobs as jobsmod
+import ai_writer as aimod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -98,9 +99,76 @@ def dashboard():
     stats = db.q("SELECT status, COUNT(*) c FROM send_log WHERE user_id=? GROUP BY status",
                  (uid(),))
     missing = config.check_prod() if os.environ.get("VERCEL") else []
+    replied_leads = db.q("""
+        SELECT l.id, l.business_name, l.email, l.campaign_id,
+               c.name AS campaign_name,
+               (SELECT n.snippet FROM notifications n
+                 WHERE n.lead_id=l.id AND n.kind='reply'
+                 ORDER BY n.id DESC LIMIT 1) AS snippet,
+               COALESCE((SELECT n.created_at FROM notifications n
+                 WHERE n.lead_id=l.id AND n.kind='reply'
+                 ORDER BY n.id DESC LIMIT 1), 0) AS replied_at
+        FROM leads l LEFT JOIN campaigns c ON c.id=l.campaign_id
+        WHERE l.user_id=? AND l.replied=1 AND (l.handled IS NULL OR l.handled=0)
+        ORDER BY 7 DESC, l.id DESC""", (uid(),))
+    for row in replied_leads:
+        row["when"] = (time.strftime("%b %d, %H:%M", time.localtime(row["replied_at"]))
+                       if row["replied_at"] else "")
     return render_template("dashboard.html", user=current_user(), campaigns=camps,
                            accounts=accts, stats={s["status"]: s["c"] for s in stats},
-                           missing=missing)
+                           missing=missing, replied_leads=replied_leads)
+
+
+@app.context_processor
+def _inject_unread():
+    """Unread notification count for the header bell, on every page."""
+    try:
+        u = current_user()
+        if u:
+            n = db.q("SELECT COUNT(*) c FROM notifications "
+                     "WHERE user_id=? AND read_at IS NULL", (u["id"],), one=True)
+            return {"unread": (n["c"] if n else 0)}
+    except Exception:
+        pass
+    return {"unread": 0}
+
+
+@app.route("/notifications")
+def notifications():
+    r = require_login()
+    if r:
+        return r
+    rows = db.q("""SELECT n.*, c.name AS campaign_name, l.business_name, l.email
+                   FROM notifications n
+                   LEFT JOIN campaigns c ON c.id=n.campaign_id
+                   LEFT JOIN leads l ON l.id=n.lead_id
+                   WHERE n.user_id=? ORDER BY n.id DESC LIMIT 100""", (uid(),))
+    for row in rows:
+        row["when"] = time.strftime("%b %d, %H:%M", time.localtime(row["created_at"]))
+    # Opening the page marks everything read.
+    db.w("UPDATE notifications SET read_at=? WHERE user_id=? AND read_at IS NULL",
+         (time.time(), uid()))
+    return render_template("notifications.html", user=current_user(), notes=rows)
+
+
+@app.route("/lead/<int:lid>/handled", methods=["POST"])
+def lead_handled(lid):
+    r = require_login()
+    if r:
+        return r
+    lead = db.q("SELECT id FROM leads WHERE id=? AND user_id=?", (lid, uid()), one=True)
+    if lead:
+        db.w("UPDATE leads SET handled=1 WHERE id=?", (lid,))
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/settings")
+def settings():
+    r = require_login()
+    if r:
+        return r
+    return render_template("settings.html", user=current_user(),
+                           ai_on=config.ai_enabled(), ai_model=config.AI_MODEL)
 
 
 # ---------------- sender accounts (Gmail SMTP via App Password) ----------------
@@ -200,15 +268,18 @@ def account_bounces(aid):
         res = sendermod.check_account_bounces(uid(), aid)
         # Reply detection rides the same inbox visit: any lead address seen in
         # recent non-bounce mail is marked replied, stopping their sequence.
+        # Newly replied leads also get a notification row + an email to the user.
         import smtp_mail as _sm
-        replied = 0
+        new_replies, notified = [], 0
         try:
-            replied = sendermod.mark_replies(uid(), _sm.scan_replies(acct))
+            new_replies = sendermod.mark_replies(uid(), _sm.scan_replies(acct))
+            notified = sendermod.notify_replies(uid(), acct, new_replies)
         except Exception:
             pass
         msg = (f"Checked {res['looked_at']} recent sends: {res['bounced_marked']} "
                f"bounces marked, rate {res['bounce_rate']*100:.1f}%; "
-               f"{replied} lead(s) marked as replied."
+               f"{len(new_replies)} lead(s) marked as replied, "
+               f"{notified} notification(s) created."
                + (" Account auto-paused." if res["paused"] else ""))
     except Exception as e:
         msg = f"Inbox scan failed: {str(e)[:200]}"
@@ -264,10 +335,14 @@ def campaign(cid):
     fu_list = followupsmod.get_followups(cid, fu_count)
     fu_map = {f["step"]: f for f in fu_list}
     seq = _lead_seq_status(cid, fu_count)
+    ai_on = config.ai_enabled()
+    ai_cost, ai_written = (aimod.avg_cost_per_lead(cid) if camp.get("autopilot")
+                           else (0.0, 0))
     return render_template("campaign.html", campaign=camp, leads=lead_rows,
                            qstat={s["status"]: s["c"] for s in qstat}, job=job,
                            fu_list=fu_list, fu_map=fu_map, fu_count=fu_count,
                            fu_defaults=followupsmod.DEFAULT_FOLLOWUPS, seq=seq,
+                           ai_on=ai_on, ai_cost=ai_cost, ai_written=ai_written,
                            user=current_user())
 
 
@@ -384,6 +459,28 @@ def campaign_enrich(cid):
     return redirect(url_for("campaign", cid=cid))
 
 
+@app.route("/campaign/<int:cid>/autopilot", methods=["POST"])
+def campaign_autopilot(cid):
+    r = require_login()
+    if r:
+        return r
+    camp = _own_campaign(cid)
+    if not camp:
+        return "Campaign not found", 404
+    if not config.ai_enabled():
+        return render_template("message.html", title="AI writing is off",
+                               message="Add OPENAI_API_KEY in Vercel (Settings > Environment "
+                                       "Variables) and redeploy to turn on AI writing.",
+                               back=url_for("campaign", cid=cid), user=current_user())
+    if not camp.get("autopilot"):
+        return render_template("message.html", title="Autopilot is off",
+                               message="Turn on the Autopilot toggle in the campaign settings "
+                                       "first, then start AI writing.",
+                               back=url_for("campaign", cid=cid), user=current_user())
+    jobsmod.start_job(uid(), cid, "autopilot")
+    return redirect(url_for("campaign", cid=cid))
+
+
 @app.route("/job/<int:jid>/status")
 def job_status(jid):
     job = db.q("SELECT * FROM jobs WHERE id=? AND user_id=?", (jid, uid()), one=True)
@@ -426,6 +523,19 @@ def campaign_template(cid):
             for s in range(1, fu_count + 1):
                 followupsmod.upsert_followup(cid, s, request.form.get(f"fu_subject_{s}", ""),
                                              request.form.get(f"fu_body_{s}", ""))
+    # Autopilot settings. The toggle only sticks when an API key is present;
+    # without one the campaign silently stays on normal templates.
+    autopilot = 1 if (request.form.get("autopilot") and config.ai_enabled()) else 0
+    mode = request.form.get("followup_mode", "fixed")
+    if mode not in ("fixed", "until_reply"):
+        mode = "fixed"
+    try:
+        max_touches = int(request.form.get("max_touches", 7) or 7)
+    except ValueError:
+        max_touches = 7
+    max_touches = max(1, min(20, max_touches))
+    db.w("UPDATE campaigns SET autopilot=?, followup_mode=?, max_touches=? "
+         "WHERE id=? AND user_id=?", (autopilot, mode, max_touches, cid, uid()))
     return redirect(url_for("campaign", cid=cid))
 
 

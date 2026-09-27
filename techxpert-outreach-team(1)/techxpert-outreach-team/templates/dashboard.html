@@ -18,6 +18,23 @@
 {% for a in accounts %}<div style="margin:4px 0"><span class="mono">{{ a.email }}</span> <span class="pill {{ 'ok' if a.status=='active' else 'bad' }}">{{ a.status }}</span></div>{% else %}<p><small>None connected. <a href="/accounts">Connect your Gmail</a> to start sending.</small></p>{% endfor %}</div>
 </div>
 
+<div class="card"><h2>&#128293; Replied leads <small>{{ replied_leads|length }} waiting for your move</small></h2>
+{% if replied_leads %}<div class="twrap"><table>
+<tr><th>Business</th><th>Email</th><th>Campaign</th><th>Reply</th><th>When</th><th></th></tr>
+{% for r in replied_leads %}<tr>
+<td><b>{{ r.business_name }}</b></td>
+<td class="mono"><small>{{ r.email }}</small></td>
+<td>{{ r.campaign_name or '' }}</td>
+<td><small>{{ r.snippet[:140] }}{% if r.snippet and r.snippet|length > 140 %}...{% endif %}</small></td>
+<td><small>{{ r.when }}</small></td>
+<td><div class="actions" style="margin:0">
+{% if r.campaign_id %}<a class="btn ghost" href="/campaign/{{ r.campaign_id }}">Open campaign</a>{% endif %}
+<form method="post" action="/lead/{{ r.id }}/handled" style="display:inline"><button class="ghost" type="submit">Mark handled</button></form>
+</div></td></tr>
+{% endfor %}</table></div>
+{% else %}<p><small>No replies yet. When a prospect replies, they land here so you can move the conversation forward yourself.</small></p>{% endif %}
+</div>
+
 <div class="card"><h2>Campaigns</h2>
 <p><a class="btn" href="/campaign/new">+ New campaign</a></p>
 <div class="twrap"><table><tr><th>Name</th><th>Niche</th><th>Location</th><th>Status</th><th>Mode</th><th></th></tr>

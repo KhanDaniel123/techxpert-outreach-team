@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block t %}Settings{% endblock %}{% block b %}
+<h1>Settings</h1>
+<div class="card"><h2>AI writing (Autopilot)</h2>
+<p>Status: {% if ai_on %}<span class="pill ok">Enabled</span>{% else %}<span class="pill mut">Disabled</span>{% endif %}</p>
+{% if ai_on %}
+<p><small>Autopilot is available. Turn it on per campaign and the app will write a personal email for each lead based on what it observes on their website, then keep following up until they reply.</small></p>
+{% else %}
+<p><small>AI writing is off. To turn it on, add an <span class="mono">OPENAI_API_KEY</span> in Vercel under Settings &gt; Environment Variables, then redeploy. Everything else works normally without it. Your key is never shown anywhere in the app.</small></p>
+{% endif %}
+</div>
+{% endblock %}

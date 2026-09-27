@@ -129,6 +129,58 @@ sequence" section):
   F1 sent/F2 queued, Replied, Bounced); the send log shows the step of every
   attempt.
 
+## Autopilot: AI writes each email (optional)
+
+Autopilot turns the app into an autonomous AI SDR for a campaign: it visits
+each lead's website, notes one thing it can actually observe, writes a short
+personal email about that observation, and keeps following up until the lead
+replies.
+
+**Turning it on.** Add `OPENAI_API_KEY` in Vercel under Settings >
+Environment Variables and redeploy. Without the key, the Autopilot toggle is
+hidden and everything works exactly as before. The key is never displayed
+anywhere in the app; Settings just shows "AI writing: Enabled/Disabled".
+
+**How it works, per campaign:**
+
+1. Tick **"Let AI write a personal email for each lead"** in the campaign's
+   Autopilot section and save.
+2. Click **Write AI emails**. A background job visits each selected lead's
+   website and runs deterministic checks (reachable? contact email/phone
+   listed? booking or quote option? reviews? social links? mobile layout?
+   slow to load?). These are plain observed facts, never guesses.
+3. A cheap AI model (`gpt-4o-mini`) writes one short email plus 3 follow-ups
+   per lead, grounded ONLY in those observed facts. The prompt forbids
+   inventing metrics, pain, revenue, or capabilities, and caps length
+   (120 words for the opener, 60 per follow-up).
+4. Each lead's email is generated once and cached, then reused. Leads with
+   no website and no business info are skipped and fall back to your normal
+   template (marked "Uses template" on the campaign page).
+5. Queue and start sending as usual. Step 0 sends the AI email, steps 1-3
+   send the AI follow-ups; beyond that the 3rd follow-up keeps cycling with
+   a polite "circling back" variation.
+
+**Follow-up mode.** Each campaign chooses: **Fixed sequence** (the default;
+uses the follow-up steps below the template) or **Keep following up until
+they reply**. In "until they reply" mode you set **max emails per lead**
+(default 7, allowed 1-20). 7 is the default because it means roughly one
+nudge every 40 hours for about 10 days: enough touches to catch busy people
+without becoming spam. Most replies come in the first few touches, and the
+sequence always stops the moment a lead replies or their email bounces,
+exactly like the fixed mode.
+
+**Cost.** About a fraction of a cent per lead (roughly $0.15 per million
+input tokens and $0.60 per million output tokens at current pricing; check
+openai.com/pricing as prices change). The campaign page shows your real
+average ("about $0.00X per email, based on N written") once the first emails
+are written, computed from actual token usage.
+
+**Honest notes.** The AI only knows what is publicly visible on the
+website; the observation is a starting hook, not a diagnosis. Reply
+detection still runs on every scheduler tick, so a reply stops all future
+touches and notifies you immediately. AI writing runs a little at a time on
+the scheduler (one lead per tick) so it never times out on serverless.
+
 ## Local development
 
 ```bash

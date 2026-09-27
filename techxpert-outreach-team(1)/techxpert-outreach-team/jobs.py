@@ -15,6 +15,7 @@ import db
 WEBSEARCH_FETCH_PER_CHUNK = 3
 ENRICH_PER_CHUNK = 2          # each site fetch + email validation can take ~10-40s
 VALIDATE_PER_CHUNK = 10
+AUTOPILOT_PER_CHUNK = 1       # one lead per tick: site fetch + 2 AI calls can take ~30-60s
 
 
 def start_job(user_id, campaign_id, kind):
@@ -31,7 +32,8 @@ def process_one_job_chunk():
         return None
     handler = {"websearch": _websearch_chunk,
                "enrich": _enrich_chunk,
-               "validate": _validate_chunk}.get(job["kind"])
+               "validate": _validate_chunk,
+               "autopilot": _autopilot_chunk}.get(job["kind"])
     if not handler:
         db.w("UPDATE jobs SET status='failed', result=? WHERE id=?",
              (f"unknown job kind {job['kind']}", job["id"]))
@@ -170,6 +172,49 @@ def _enrich_chunk(job):
     _save(job["id"], done=done + len(rows),
           result=f"{updated} new emails so far")
 
+
+# ---------------- autopilot (AI email writing) ----------------
+
+def _autopilot_chunk(job):
+    """Write AI emails for selected leads with an email address, one lead per
+    chunk (site fetch + 2 AI calls can take ~30-60s, so never more). Cached
+    leads are skipped, never regenerated. Runs only while the campaign's
+    autopilot toggle is on."""
+    import ai_writer as aimod
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (job["campaign_id"],), one=True)
+    if not camp or not camp.get("autopilot"):
+        _save(job["id"], status="done",
+              result="autopilot is off for this campaign; nothing written")
+        return
+    p = _payload(job)
+    if not p.get("init"):
+        total = db.q(
+            "SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND selected=1 AND email<>''",
+            (job["campaign_id"],), one=True)["c"]
+        p = {"init": True, "last_id": 0}
+        _save(job["id"], p, total=total, done=0, result="AI writing queued")
+        db.w("UPDATE leads SET ai_status='pending' WHERE campaign_id=? AND selected=1 "
+             "AND email<>'' AND (ai_status IS NULL OR ai_status='')",
+             (job["campaign_id"],))
+        if total == 0:
+            _save(job["id"], p, status="done", result="no leads to write for")
+        return
+    rows = db.q(
+        "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>'' AND id>? "
+        "ORDER BY id LIMIT ?",
+        (job["campaign_id"], p.get("last_id", 0), AUTOPILOT_PER_CHUNK))
+    if not rows:
+        _save(job["id"], status="done", result="AI writing complete")
+        return
+    for lead in rows:
+        if not aimod.get_ai_content(lead["id"]):
+            aimod.generate_and_store(lead, camp)
+    p["last_id"] = rows[-1]["id"]
+    done = db.q("SELECT done FROM jobs WHERE id=?", (job["id"],), one=True)["done"] or 0
+    ready = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND ai_status='ready'",
+                 (job["campaign_id"],), one=True)["c"]
+    _save(job["id"], p, done=done + len(rows),
+          result=f"{ready} AI emails written so far")
 
 # ---------------- validate ----------------
 

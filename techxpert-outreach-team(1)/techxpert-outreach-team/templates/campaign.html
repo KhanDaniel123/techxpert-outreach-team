@@ -11,6 +11,7 @@
 <form method="post" action="/campaign/{{ campaign.id }}/websearch"><button class="ghost" type="submit">Find leads (web search)</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/enrich"><button class="ghost" type="submit">Run enrichment (find emails)</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/validate"><button class="ghost" type="submit" title="Re-run email validation on selected leads">Validate emails</button></form>
+{% if ai_on and campaign.autopilot %}<form method="post" action="/campaign/{{ campaign.id }}/autopilot"><button class="ghost" type="submit" title="Write a personal AI email for each selected lead">Write AI emails</button></form>{% endif %}
 </div>
 {% if job %}<p><small>Last job [{{ job.kind }}]: <span class="pill {{ 'ok' if job.status=='done' else ('bad' if job.status=='failed' else 'mut') }}">{{ job.status }}</span> {{ job.done }}/{{ job.total }} {{ job.result }}</small>
 {% if job.status=='running' %} <button class="ghost" onclick="location.reload()">Refresh</button>{% endif %}</p>
@@ -22,7 +23,7 @@
 <div><input name="phone" placeholder="Phone"></div>
 <div><input name="personalized_line" placeholder="Personalized line (optional)"></div>
 <div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
-<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Form?</th><th>Sequence</th><th>Notes</th></tr>
+<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Form?</th><th>Sequence</th>{% if campaign.autopilot %}<th>AI email</th>{% endif %}<th>Notes</th></tr>
 {% for l in leads %}<tr>
 <td><form method="post" action="/campaign/{{ campaign.id }}/toggle_lead">
 <input type="hidden" name="lead_id" value="{{ l.id }}">
@@ -33,8 +34,9 @@
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
 <td>{{ 'yes' if l.has_contact_form else '' }}</td>
 <td><span class="pill {{ seq.get(l.id, ('-', 'mut'))[1] }}">{{ seq.get(l.id, ('-', 'mut'))[0] }}</span></td>
+{% if campaign.autopilot %}<td>{% if l.ai_status == 'ready' %}<span class="pill ok">AI written</span>{% elif l.ai_status == 'pending' %}<span class="pill mut">Writing...</span>{% elif l.ai_status == 'skipped' %}<span class="pill mut" title="{{ l.ai_note }}">Uses template</span>{% elif l.ai_status == 'error' %}<span class="pill bad" title="{{ l.ai_note }}">AI failed</span>{% else %}<span class="pill mut">-</span>{% endif %}</td>{% endif %}
 <td><small>{{ l.notes }}</small>{% if l.personalized_line %}<br><small style="color:#9bd8ff">{{ l.personalized_line }}</small>{% endif %}</td></tr>
-{% else %}<tr><td colspan="9"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
+{% else %}<tr><td colspan="{{ 10 if campaign.autopilot else 9 }}"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
 
 <div class="card"><h2>Message template</h2>
 <form method="post" action="/campaign/{{ campaign.id }}/template">
@@ -49,8 +51,27 @@
 <p><label><input type="checkbox" name="dry_run" {{ 'checked' if campaign.dry_run }} style="width:auto"> Dry-run mode (log, don't send)</label></p>
 
 <hr style="margin:18px 0;border-color:#1b2a4a">
+<h2>Autopilot: AI writes each email</h2>
+{% if not ai_on %}
+<p class="notice">AI writing is off. To turn it on, add <span class="mono">OPENAI_API_KEY</span> in Vercel under Settings &gt; Environment Variables, then redeploy. Your normal templates below keep working as usual.</p>
+{% else %}
+<p><label><input type="checkbox" name="autopilot" {{ 'checked' if campaign.autopilot }} style="width:auto"> Let AI write a personal email for each lead</label></p>
+<p><small class="mut">When on, the app visits each lead's website, notes one thing it can actually see (no booking page, no phone number, no reviews...), and writes a short personal email about that observation. It only ever mentions things it really saw, never guesses or invents numbers. Each email costs a fraction of a cent. Leads it can't write for automatically fall back to your template below.</small></p>
+{% if campaign.autopilot and ai_written %}<p><small>Cost so far: about ${{ "%.4f"|format(ai_cost) }} per email, based on {{ ai_written }} written.</small></p>{% endif %}
+{% if campaign.autopilot %}<p><small>After saving, click <b>Write AI emails</b> in the Leads section above. Writing runs a little at a time on the scheduler so it never times out.</small></p>{% endif %}
+{% endif %}
+
+<hr style="margin:18px 0;border-color:#1b2a4a">
 <h2>Follow-up sequence</h2>
 <p><label><input type="checkbox" name="followups_enabled" {{ 'checked' if campaign.followups_enabled }} style="width:auto"> Enable follow-ups</label></p>
+<p><small class="mut">How should follow-ups behave?</small></p>
+<p><label><input type="radio" name="followup_mode" value="fixed" {{ 'checked' if (campaign.followup_mode or 'fixed') == 'fixed' }} style="width:auto"> Fixed sequence: send the follow-up steps below, then stop</label><br>
+<label><input type="radio" name="followup_mode" value="until_reply" {{ 'checked' if campaign.followup_mode == 'until_reply' }} style="width:auto"> Keep following up until they reply <small class="mut">(uses the AI follow-ups when Autopilot is on)</small></label></p>
+<div class="row">
+<div><label><small>Max emails per lead (1-20)</small></label><input type="number" name="max_touches" min="1" max="20" value="{{ campaign.max_touches or 7 }}"></div></div>
+<p><small class="mut">Only used in "until they reply" mode. 7 is the default: roughly one nudge every 40 hours for about 10 days. Most replies come in the first few touches, and it always stops the moment a lead replies or their email bounces.</small></p>
+<p id="fu_mode_note" style="display:none"><small class="mut">In "until they reply" mode the fixed steps below are hidden and not used. Follow-ups come from the AI emails instead (steps 1-3), then keep circling back politely until the max is reached, a reply arrives, or the email bounces.</small></p>
+<div id="fu_fixed_block">
 <div class="row">
 <div><label><small>Number of follow-ups (1-10)</small></label><input type="number" id="fu_count" name="followup_count" min="1" max="10" value="{{ fu_count }}"></div>
 <div><label><small>Hours between steps</small></label><input type="number" name="followup_delay_hours" min="1" max="720" value="{{ campaign.followup_delay_hours or 40 }}"></div></div>
@@ -66,6 +87,7 @@
 </div>
 {% endfor %}
 </div>
+</div>
 <script>
 (function(){
   var c = document.getElementById('fu_count');
@@ -78,6 +100,18 @@
     });
   }
   c.addEventListener('input', syncFu);
+  var block = document.getElementById('fu_fixed_block');
+  function syncMode(){
+    var m = document.querySelector('input[name="followup_mode"]:checked');
+    var untilReply = m && m.value === 'until_reply';
+    if (block) block.style.display = untilReply ? 'none' : '';
+    var note = document.getElementById('fu_mode_note');
+    if (note) note.style.display = untilReply ? '' : 'none';
+  }
+  document.querySelectorAll('input[name="followup_mode"]').forEach(function(r){
+    r.addEventListener('change', syncMode);
+  });
+  syncMode();
 })();
 </script>
 

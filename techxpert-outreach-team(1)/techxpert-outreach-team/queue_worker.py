@@ -47,6 +47,37 @@ def enqueue_campaign(user_id, campaign_id):
     return n
 
 
+def _schedule_until_reply(camp, lead, nxt):
+    """'Until they reply' mode: keep nudging every followup_delay_hours until
+    max_touches total emails have gone out (steps 0..max_touches-1). Steps 1-3
+    use the AI follow-ups; beyond that the 3rd follow-up cycles with a
+    rotating prefix. Reply/bounce still stop everything via sequence_gate.
+    Leads without AI content fall back to the fixed step list."""
+    import ai_writer as _ai
+    try:
+        max_t = max(1, min(20, int(camp.get("max_touches") or 7)))
+    except (TypeError, ValueError):
+        max_t = 7
+    if nxt >= max_t:
+        return  # touches are steps 0..max_t-1; never exceed max_touches
+    if not (camp.get("autopilot") and _ai.get_ai_content(lead["id"])):
+        # No AI content for this lead: behave like fixed mode.
+        count = followups.step_count(camp)
+        if nxt > count:
+            return
+        fu = followups.get_followup(camp["id"], nxt)
+        if not fu or not (fu["body_tpl"] or "").strip():
+            return
+    exists = db.q("SELECT id FROM send_queue WHERE campaign_id=? AND lead_id=? AND step=?",
+                  (camp["id"], lead["id"], nxt), one=True)
+    if exists:
+        return
+    delay_h = followups.delay_hours(camp)
+    db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at, step)"
+         " VALUES (?,?, 'pending', ?, ?)",
+         (camp["id"], lead["id"], time.time() + delay_h * 3600, nxt))
+
+
 def _schedule_next_step(camp, lead, step):
     """After step N sent, queue step N+1 for `followup_delay_hours` later.
 
@@ -56,6 +87,9 @@ def _schedule_next_step(camp, lead, step):
     if not camp.get("followups_enabled", 1):
         return
     nxt = (step or 0) + 1
+    if (camp.get("followup_mode") or "fixed") == "until_reply":
+        _schedule_until_reply(camp, lead, nxt)
+        return
     count = followups.step_count(camp)
     if nxt > count:
         return
@@ -169,7 +203,9 @@ def _scan_replies_all():
     """Best-effort reply detection across all active sender accounts.
 
     Runs on every scheduler tick so a lead's reply stops their follow-up
-    sequence promptly. IMAP failures degrade to zero marked; never raises.
+    sequence promptly. Newly replied leads also get a notification row and
+    an email to the user's login address. IMAP failures degrade to zero
+    marked; never raises.
     """
     marked = 0
     try:
@@ -179,9 +215,10 @@ def _scan_replies_all():
     for a in accts:
         try:
             import smtp_mail
-            addrs = smtp_mail.scan_replies(a)
-            if addrs:
-                marked += sender.mark_replies(a["user_id"], addrs)
+            new_replies = sender.mark_replies(a["user_id"], smtp_mail.scan_replies(a))
+            if new_replies:
+                sender.notify_replies(a["user_id"], a, new_replies)
+                marked += len(new_replies)
         except Exception:
             continue
     return marked

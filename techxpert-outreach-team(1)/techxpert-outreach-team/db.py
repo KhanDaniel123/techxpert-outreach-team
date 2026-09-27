@@ -121,6 +121,8 @@ leads = Table("leads", metadata,
               Column("selected", Integer, nullable=False, server_default="1"),
               Column("replied", Integer, nullable=False, server_default="0"),
               # replied=1: lead replied (via IMAP reply scan); sequence stops
+              Column("handled", Integer, nullable=False, server_default="0"),
+              # handled=1: user marked the replied lead handled; hidden from the hot list
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
@@ -172,6 +174,37 @@ jobs = Table("jobs", metadata,
              Column("payload", Text, default=""),  # JSON cursor for chunked serverless jobs
              Column("created_at", Float, nullable=False))
 
+# Autopilot AI content: one cached AI-written email + 3 follow-ups per lead.
+# Generated once (by the autopilot job); sending only reads this table, so a
+# lead is never generated twice and costs stay predictable.
+ai_content = Table("ai_content", metadata,
+                   Column("id", Integer, primary_key=True, autoincrement=True),
+                   Column("lead_id", Integer, nullable=False, unique=True),
+                   Column("subject", Text, default=""),
+                   Column("body", Text, default=""),
+                   Column("fu1_subj", Text, default=""),
+                   Column("fu1_body", Text, default=""),
+                   Column("fu2_subj", Text, default=""),
+                   Column("fu2_body", Text, default=""),
+                   Column("fu3_subj", Text, default=""),
+                   Column("fu3_body", Text, default=""),
+                   Column("findings_json", Text, default="[]"),
+                   Column("tokens_in", Integer, nullable=False, server_default="0"),
+                   Column("tokens_out", Integer, nullable=False, server_default="0"),
+                   Column("created_at", Float, nullable=False))
+# Reply notifications: one row per replied lead per user. created_at is the
+# detection time; read_at is set when the user opens the notifications page.
+notifications = Table("notifications", metadata,
+                      Column("id", Integer, primary_key=True, autoincrement=True),
+                      Column("user_id", Integer, nullable=False),
+                      Column("lead_id", Integer),
+                      Column("campaign_id", Integer),
+                      Column("kind", Text, nullable=False, server_default=_sd("'reply'")),
+                      Column("title", Text, default=""),
+                      Column("snippet", Text, default=""),
+                      Column("created_at", Float, nullable=False),
+                      Column("read_at", Float, nullable=True))
+
 
 def init_db():
     # CREATE TABLE IF NOT EXISTS under the hood; safe to run on every boot,
@@ -192,15 +225,66 @@ def _migrate():
     want = {
         "campaigns": ["followups_enabled INTEGER DEFAULT 1",
                       "followup_count INTEGER DEFAULT 5",
-                      "followup_delay_hours INTEGER DEFAULT 40"],
+                      "followup_delay_hours INTEGER DEFAULT 40",
+                      "autopilot INTEGER DEFAULT 0",
+                      "followup_mode TEXT DEFAULT 'fixed'",
+                      "max_touches INTEGER DEFAULT 7"],
         "send_queue": ["step INTEGER DEFAULT 0"],
         "send_log": ["step INTEGER DEFAULT 0"],
         "leads": ["replied INTEGER DEFAULT 0",
-                  "personalized_line TEXT"],
+                  "personalized_line TEXT",
+                  "handled INTEGER DEFAULT 0",
+                  "ai_status TEXT DEFAULT ''",
+                  "ai_note TEXT DEFAULT ''"],
     }
     for table, cols in want.items():
         for ddl in cols:
             _add_column(table, ddl)
+    _ensure_notifications_table()
+    _ensure_ai_content_table()
+
+
+def _ensure_notifications_table():
+    """Idempotent CREATE TABLE for databases that predate the notifications
+    table (create_all() already covers fresh DBs; this covers the rest)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS notifications ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "user_id INTEGER NOT NULL, lead_id INTEGER, campaign_id INTEGER, "
+               "kind TEXT DEFAULT 'reply', title TEXT DEFAULT '', snippet TEXT DEFAULT '', "
+               "created_at FLOAT NOT NULL, read_at FLOAT)")
+        # Postgres uses SERIAL, not AUTOINCREMENT
+        if IS_POSTGRES:
+            ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                              "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
+
+
+def _ensure_ai_content_table():
+    """Idempotent CREATE TABLE for the autopilot cache (covers databases
+    that predate the table; create_all() covers fresh DBs)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS ai_content ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "lead_id INTEGER NOT NULL UNIQUE, subject TEXT DEFAULT '', "
+               "body TEXT DEFAULT '', fu1_subj TEXT DEFAULT '', fu1_body TEXT DEFAULT '', "
+               "fu2_subj TEXT DEFAULT '', fu2_body TEXT DEFAULT '', "
+               "fu3_subj TEXT DEFAULT '', fu3_body TEXT DEFAULT '', "
+               "findings_json TEXT DEFAULT '[]', "
+               "tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0, "
+               "created_at FLOAT NOT NULL)")
+        if IS_POSTGRES:
+            ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                              "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
 
 
 def _add_column(table, ddl):

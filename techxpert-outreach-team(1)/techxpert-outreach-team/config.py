@@ -12,6 +12,9 @@ Required env vars (see README for the deploy guide):
 Optional:
     SENDING_TZ_NOTE - not used in code; sending windows are evaluated in server
                       local time (UTC on Vercel). Documented in README.
+    OPENAI_API_KEY  - enables Autopilot (AI-written emails). Without it the
+                      autopilot toggle is hidden and the app works exactly as
+                      before. The key is never displayed in the UI.
 
 There is deliberately NO Google OAuth here. Login is built-in
 email + password (auth.py); sending is direct Gmail SMTP with per-user
@@ -24,6 +27,20 @@ APP_URL = os.environ.get("APP_URL", "http://localhost:5000").rstrip("/")
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 FERNET_KEY = os.environ.get("FERNET_KEY", "")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+
+# Autopilot AI model. Cheap and fast; the model name is a constant so a
+# future swap is one line. Pricing (approx, check openai.com/pricing):
+# gpt-4o-mini is ~$0.15 / 1M input tokens and ~$0.60 / 1M output tokens,
+# which works out to a fraction of a cent per lead.
+AI_MODEL = "gpt-4o-mini"
+AI_PRICE_IN_PER_M = 0.15   # USD per million input tokens (approx)
+AI_PRICE_OUT_PER_M = 0.60  # USD per million output tokens (approx)
+
+
+def ai_enabled():
+    """Is AI writing available? Never expose the key itself."""
+    return bool(OPENAI_API_KEY)
 
 # Stable session secret derived from FERNET_KEY so logins survive across
 # serverless invocations (a random key would log everyone out on each cold start).

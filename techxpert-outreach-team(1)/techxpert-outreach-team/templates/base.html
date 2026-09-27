@@ -78,6 +78,11 @@ button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accen
   text-shadow:0 2px 14px rgba(0,40,90,.4);position:relative;z-index:1}
 .hero p{color:#f2f8ff;margin:0;position:relative;z-index:1;font-weight:500}
 .hero small{color:#d9ecff}
+/* notification bell */
+nav a.bell{position:relative;font-size:16px;line-height:1;text-decoration:none}
+nav a.bell .badge{position:absolute;top:-9px;right:-12px;background:var(--bad);color:#fff;
+  font-size:10px;font-weight:800;border-radius:999px;padding:0 5px;line-height:16px;min-width:16px;
+  text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.4)}
 /* misc */
 .actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
 .hr{border:0;border-top:1px solid var(--border);margin:16px 0}
@@ -96,6 +101,6 @@ button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accen
 .steps li{margin:6px 0}
 @media(max-width:640px){h1{font-size:22px}nav{gap:12px;padding:10px 12px}nav a.nl{font-size:13px}.card{padding:14px}}
 </style></head><body>
-<nav><a class="brand" href="/dashboard">TechXpert <b>Outreach</b></a>{% if user %}<a class="nl" href="/dashboard">Dashboard</a><a class="nl" href="/accounts">Sender accounts</a><a class="nl" href="/logs">Send log</a><span class="who"><span>{{ user.email }}</span><a class="nl" href="/logout">Logout</a></span>{% endif %}</nav>
+<nav><a class="brand" href="/dashboard">TechXpert <b>Outreach</b></a>{% if user %}<a class="nl" href="/dashboard">Dashboard</a><a class="nl" href="/accounts">Sender accounts</a><a class="nl" href="/logs">Send log</a><a class="nl" href="/settings">Settings</a><a class="bell" href="/notifications" title="Notifications">&#128276;{% if unread %}<span class="badge">{{ unread }}</span>{% endif %}</a><span class="who"><span>{{ user.email }}</span><a class="nl" href="/logout">Logout</a></span>{% endif %}</nav>
 {% block b %}{% endblock %}
 </body></html>

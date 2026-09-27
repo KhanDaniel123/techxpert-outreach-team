@@ -158,9 +158,33 @@ def record_send(user_id, campaign_id, account_id, lead_id, recipient,
     return lid
 
 
-def _templates_for(campaign, step):
+def _templates_for(campaign, step, lead=None):
     """Return (subject_tpl, body_tpl) for a queue step.
-    Step 0 = the campaign's main template; steps 1..10 = follow-up rows."""
+    Step 0 = the campaign's main template; steps 1..10 = follow-up rows.
+
+    On autopilot campaigns, a lead with cached AI content gets the AI email
+    (step 0) and AI follow-ups (steps 1-3). Steps beyond 3 cycle the 3rd
+    follow-up with a rotating "circling back" prefix ({business_name} in the
+    prefix is rendered by the caller's render_template). Leads without AI
+    content fall back to the normal templates."""
+    if campaign.get("autopilot") and lead:
+        import ai_writer as _ai
+        ai = _ai.get_ai_content(lead["id"])
+        if ai and (ai.get("subject") or ai.get("body")):
+            if not step:
+                return ai["subject"] or "", ai["body"] or ""
+            if 1 <= step <= 3:
+                subj = ai.get(f"fu{step}_subj") or ""
+                body = ai.get(f"fu{step}_body") or ""
+                if subj or body:
+                    return subj, body
+            else:
+                prefixes = _ai.FOLLOWUP_CYCLE_PREFIXES
+                prefix = prefixes[(step - 4) % len(prefixes)]
+                subj = ai.get("fu3_subj") or ""
+                body = prefix + (ai.get("fu3_body") or "")
+                if subj or body:
+                    return subj, body
     if step and step > 0:
         fu = db.q("SELECT * FROM followups WHERE campaign_id=? AND step=?",
                   (campaign["id"], step), one=True)
@@ -196,18 +220,95 @@ def sequence_gate(user_id, campaign_id, lead, step):
     return True, ""
 
 
-def mark_replies(user_id, reply_addrs):
-    """Mark leads as replied for any matching address. Returns count marked."""
-    marked = 0
-    for addr in set((a or "").lower() for a in reply_addrs or []):
-        if "@" not in addr:
+def mark_replies(user_id, replies):
+    """Mark leads as replied for any matching address.
+
+    `replies`: list of dicts {address, snippet, date} from
+    smtp_mail.scan_replies (plain address strings also accepted).
+    Returns a list of dicts for NEWLY-marked leads only (a lead already
+    marked replied is never returned twice):
+    {lead_id, business_name, email, campaign_id, campaign_name,
+     snippet, reply_date}.
+    """
+    newly = []
+    seen = set()
+    for r in replies or []:
+        if isinstance(r, dict):
+            addr = (r.get("address") or "").lower()
+            snippet = r.get("snippet") or ""
+            rdate = r.get("date")
+        else:
+            addr = (r or "").lower()
+            snippet, rdate = "", None
+        if "@" not in addr or addr in seen:
             continue
-        rows = db.q("SELECT id FROM leads WHERE user_id=? AND lower(email)=? AND replied=0",
+        seen.add(addr)
+        rows = db.q("SELECT id, business_name, email, campaign_id FROM leads "
+                    "WHERE user_id=? AND lower(email)=? AND replied=0",
                     (user_id, addr))
-        for r in rows:
-            db.w("UPDATE leads SET replied=1 WHERE id=?", (r["id"],))
-            marked += 1
-    return marked
+        for row in rows:
+            db.w("UPDATE leads SET replied=1 WHERE id=?", (row["id"],))
+            camp = None
+            if row["campaign_id"]:
+                camp = db.q("SELECT id, name FROM campaigns WHERE id=?",
+                            (row["campaign_id"],), one=True)
+            newly.append({
+                "lead_id": row["id"],
+                "business_name": row["business_name"] or "",
+                "email": row["email"] or "",
+                "campaign_id": row["campaign_id"],
+                "campaign_name": (camp["name"] if camp else "") or "",
+                "snippet": snippet,
+                "reply_date": rdate,
+            })
+    return newly
+
+
+def notify_replies(user_id, account, new_replies):
+    """For each newly-marked replied lead: store one notification row
+    (deduped per lead) and email the user at their login address from their
+    sender account.
+
+    Never raises. If there is no sender account to send from (or no login
+    email on file), the notification is still stored and the email is
+    skipped gracefully. Returns the number of notification rows created.
+    """
+    import config
+    created = 0
+    user = db.get_user(user_id)
+    user_email = ((user or {}).get("email") or "").strip()
+    app_url = (config.APP_URL or "").rstrip("/")
+    for nr in new_replies or []:
+        exists = db.q("SELECT id FROM notifications WHERE user_id=? AND lead_id=? "
+                      "AND kind='reply' LIMIT 1",
+                      (user_id, nr["lead_id"]), one=True)
+        if not exists:
+            title = f"Reply from {nr['business_name'] or nr['email']}"
+            db.w("""INSERT INTO notifications
+                    (user_id, lead_id, campaign_id, kind, title, snippet, created_at, read_at)
+                    VALUES (?,?,?,?,?,?,?,NULL)""",
+                 (user_id, nr["lead_id"], nr["campaign_id"], "reply",
+                  title, nr["snippet"] or "", time.time()))
+            created += 1
+        if account and user_email:
+            try:
+                import smtp_mail
+                who = nr["business_name"] or nr["email"]
+                camp = nr["campaign_name"] or "your campaign"
+                subject = f"Reply from {who} ({camp})"
+                link = (f"{app_url}/campaign/{nr['campaign_id']}"
+                        if nr.get("campaign_id") else f"{app_url}/dashboard")
+                body = (
+                    f"{who} ({nr['email']}) replied to your email"
+                    + (f" in campaign \"{nr['campaign_name']}\"" if nr["campaign_name"] else "")
+                    + ".\n\n--- reply snippet ---\n"
+                    + ((nr["snippet"] or "(no text captured)")[:1500])
+                    + f"\n\nMove it forward yourself: {link}\n"
+                )
+                smtp_mail.send_message(account, user_email, subject, body)
+            except Exception:
+                pass
+    return created
 
 
 def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
@@ -220,7 +321,7 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
         return {"ok": False, "reason": "no_eligible_account",
                 "detail": "No active sender account under its daily cap inside the sending window."}
 
-    subject_tpl, body_tpl = _templates_for(campaign, step)
+    subject_tpl, body_tpl = _templates_for(campaign, step, lead)
     if body_tpl is None:
         return {"ok": False, "reason": "no_followup_template",
                 "detail": f"Follow-up step {step} has no template; sequence ends here."}
