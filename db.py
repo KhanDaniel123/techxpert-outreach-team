@@ -133,6 +133,10 @@ leads = Table("leads", metadata,
               Column("unsubscribed", Integer, nullable=False, server_default="0"),
               # unsubscribed=1: lead opted out via the one-click unsubscribe
               # link; never queued or mailed again (same as reply/bounce guards)
+              Column("fit", Text, default=""),
+              # lead_quality.detect_fit: "possible_chain" when chain/franchise
+              # signals are found, "independent" when checked with no signals,
+              # "" when not checked yet. The ICP is independent businesses.
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
@@ -261,7 +265,8 @@ def _migrate():
                   "handled INTEGER DEFAULT 0",
                   "ai_status TEXT DEFAULT ''",
                   "ai_note TEXT DEFAULT ''",
-                  "unsubscribed INTEGER DEFAULT 0"],
+                  "unsubscribed INTEGER DEFAULT 0",
+                  "fit TEXT DEFAULT ''"],
     }
     for table, cols in want.items():
         for ddl in cols:

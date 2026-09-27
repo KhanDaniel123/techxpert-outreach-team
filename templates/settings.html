@@ -26,4 +26,19 @@
 {{ company_address }}
 Unsubscribe: {{ request.host_url.rstrip('/') }}/unsubscribe?t=...</small></p>
 </div>
+<div class="card"><h2>Connection tests</h2>
+<p><small>Check that your Gmail and AI writing work, without touching any campaign. Nothing here emails a lead.</small></p>
+<h3 style="margin-top:0">Test Gmail</h3>
+<p><small>Sends one real test email through your connected Gmail account, only to the address you type below.</small></p>
+<form method="post" action="/settings/test-gmail" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Sending test...';">
+<div style="margin-bottom:12px"><label><small>Send the test to</small></label><br>
+<input type="email" name="to_addr" value="{{ user.email }}" required style="width:100%;max-width:420px" maxlength="160"></div>
+<button type="submit">Test Gmail</button>
+</form>
+<h3>Test AI writer</h3>
+<p><small>Writes a sample subject line and opener for a fictional business using your saved AI key. The key is never shown.</small></p>
+<form method="post" action="/settings/test-ai" onsubmit="var b=this.querySelector('button');b.disabled=true;b.textContent='Writing sample...';">
+<button type="submit">Test AI writer</button>
+</form>
+</div>
 {% endblock %}

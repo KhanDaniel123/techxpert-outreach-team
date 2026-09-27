@@ -1555,6 +1555,140 @@ nm0, ad0 = unsubmod.get_company_info(fresh["id"])
 check("defaults are TechXpert + placeholder",
       nm0 == "TechXpert" and ad0 == unsubmod.ADDRESS_PLACEHOLDER)
 
+# ================= 15. campaign resume + delete =================
+u_rd = make_user("resume-del@example.com")
+c_rd = login_client("resume-del@example.com")
+cid_rd = make_campaign(c_rd, name="Doomed Campaign")
+c_rd.post(f"/campaign/{cid_rd}/stop")
+st = db.q("SELECT status FROM campaigns WHERE id=?", (cid_rd,), one=True)["status"]
+check("stop sets stopped", st == "stopped")
+r = c_rd.get(f"/campaign/{cid_rd}")
+check("campaign page shows Resume when stopped", b"Resume" in r.data)
+check("campaign page links delete confirm",
+      f"/campaign/{cid_rd}/delete".encode() in r.data)
+c_rd.post(f"/campaign/{cid_rd}/resume")
+st = db.q("SELECT status FROM campaigns WHERE id=?", (cid_rd,), one=True)["status"]
+check("resume sets sending", st == "sending")
+r = c_rd.get(f"/campaign/{cid_rd}")
+check("campaign page shows Stop when sending",
+      b"/stop" in r.data and b">Resume<" not in r.data)
+
+# cross-user: cannot resume or delete someone else's campaign
+u_rd2 = make_user("resume-del2@example.com")
+c_rd2 = login_client("resume-del2@example.com")
+cid_rd2 = make_campaign(c_rd2, name="Other Campaign")
+c_rd2.post(f"/campaign/{cid_rd2}/stop")
+c_rd.post(f"/campaign/{cid_rd2}/resume")
+st = db.q("SELECT status FROM campaigns WHERE id=?", (cid_rd2,), one=True)["status"]
+check("cannot resume another user's campaign", st == "stopped")
+r = c_rd.get(f"/campaign/{cid_rd2}/delete")
+check("cannot open another user's delete page", r.status_code == 404)
+r = c_rd.post(f"/campaign/{cid_rd2}/delete", data={"confirm_name": "Other Campaign"})
+check("cannot delete another user's campaign",
+      r.status_code == 404
+      and db.q("SELECT id FROM campaigns WHERE id=?", (cid_rd2,), one=True) is not None)
+
+# delete confirmation page documents what goes and what stays
+lid = add_lead(cid_rd, u_rd["id"], "gone@example.com", "Gone Biz")
+db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at) VALUES (?,?, 'pending', 0)",
+     (cid_rd, lid))
+db.w("INSERT INTO followups (campaign_id, step, subject_tpl, body_tpl, created_at) VALUES (?,?,?,?,?)",
+     (cid_rd, 1, "s", "b", time.time()))
+db.w("INSERT INTO ai_content (lead_id, subject, body, created_at) VALUES (?,?,?,?)",
+     (lid, "s", "b", time.time()))
+r = c_rd.get(f"/campaign/{cid_rd}/delete")
+check("delete confirm page renders",
+      r.status_code == 200 and b"permanently delete" in r.data
+      and b"Doomed Campaign" in r.data)
+check("delete page lists what is removed and kept",
+      b"queued (unsent)" in r.data and b"send log" in r.data)
+r = c_rd.post(f"/campaign/{cid_rd}/delete", data={"confirm_name": "Wrong Name"})
+check("wrong confirm name deletes nothing",
+      r.status_code == 200 and b"does not match" in r.data
+      and db.q("SELECT id FROM campaigns WHERE id=?", (cid_rd,), one=True) is not None)
+r = c_rd.post(f"/campaign/{cid_rd}/delete", data={"confirm_name": "Doomed Campaign"},
+              follow_redirects=False)
+check("correct confirm name deletes and redirects", r.status_code == 302)
+check("campaign row gone",
+      db.q("SELECT id FROM campaigns WHERE id=?", (cid_rd,), one=True) is None)
+check("campaign leads gone",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cid_rd,), one=True)["c"] == 0)
+check("campaign queue gone",
+      db.q("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=?", (cid_rd,), one=True)["c"] == 0)
+check("campaign followups gone",
+      db.q("SELECT COUNT(*) c FROM followups WHERE campaign_id=?", (cid_rd,), one=True)["c"] == 0)
+check("campaign ai cache gone",
+      db.q("SELECT COUNT(*) c FROM ai_content WHERE lead_id=?", (lid,), one=True)["c"] == 0)
+
+# ================= 16. self-serve connection tests =================
+import smtplib as _smtplib_test
+import config as configmod
+import ai_writer as aiwmod
+
+r = c_rd.get("/settings")
+check("settings shows connection tests card", b"Connection tests" in r.data)
+
+# Gmail test: mocked SMTP, goes only to the typed address
+u_gt = make_user("gtest@example.com")
+add_account(u_gt["id"], "testsender@gmail.com")
+c_gt = login_client("gtest@example.com")
+sent = {}
+def fake_send(account, to_addr, subject, body, list_unsub_url=None):
+    sent.update(account=account["email"], to=to_addr, subject=subject, body=body)
+    return True
+with mock.patch.object(smtp_mail, "send_message", side_effect=fake_send):
+    r = c_gt.post("/settings/test-gmail", data={"to_addr": "me@example.com"})
+check("gmail test success page", r.status_code == 200 and b"Test email sent" in r.data)
+check("gmail test sends only to typed address",
+      sent.get("to") == "me@example.com" and sent.get("account") == "testsender@gmail.com")
+check("gmail test subject is a test, not campaign mail",
+      "connection test" in (sent.get("subject") or "").lower())
+r = c_gt.post("/settings/test-gmail", data={"to_addr": "not-an-email"})
+check("gmail test rejects bad address", b"valid email address" in r.data)
+
+# Gmail test with no connected account
+u_gn = make_user("gnoaccount@example.com")
+c_gn = login_client("gnoaccount@example.com")
+with mock.patch.object(smtp_mail, "send_message", side_effect=fake_send):
+    r = c_gn.post("/settings/test-gmail", data={"to_addr": "me@example.com"})
+check("gmail test without account explains connect",
+      b"not connected" in r.data and b"/accounts" in r.data)
+
+# Gmail test surfaces auth failure in plain language, no secret leak
+def boom_auth(*a, **k):
+    raise _smtplib_test.SMTPAuthenticationError(535, b"bad credentials")
+with mock.patch.object(smtp_mail, "send_message", side_effect=boom_auth):
+    r = c_gt.post("/settings/test-gmail", data={"to_addr": "me@example.com"})
+check("gmail auth failure is plain language",
+      b"Gmail login failed" in r.data and b"rejected the login" in r.data)
+check("gmail auth failure never leaks password",
+      b"abcdefghijklmnop" not in r.data)
+
+# AI test with no key configured (section 10 leaves a fake key set; clear it)
+_old_o, _old_g = configmod.OPENAI_API_KEY, configmod.GEMINI_API_KEY
+configmod.OPENAI_API_KEY = ""
+configmod.GEMINI_API_KEY = ""
+try:
+    r = c_gt.post("/settings/test-ai")
+    check("ai test with no key explains setup", b"AI writing is off" in r.data)
+finally:
+    configmod.OPENAI_API_KEY = _old_o
+    configmod.GEMINI_API_KEY = _old_g
+
+# AI test with mocked provider: draft shown, key never shown
+with mock.patch.object(configmod, "ai_enabled", return_value=True), \
+     mock.patch.object(configmod, "ai_model_name", return_value="test-model"), \
+     mock.patch.object(aiwmod, "generate_email",
+                       return_value=("Quick question, Sample Fitness Studio",
+                                     "Hi Sample Fitness Studio, I noticed the site has no booking page.",
+                                     {"input": 1, "output": 1})):
+    r = c_gt.post("/settings/test-ai")
+check("ai test renders draft",
+      r.status_code == 200 and b"Quick question, Sample Fitness Studio" in r.data
+      and b"no booking page" in r.data)
+check("ai test never reveals key",
+      b"GEMINI_API_KEY" not in r.data and b"sk-" not in r.data)
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:
     print("FAILED:", failed)

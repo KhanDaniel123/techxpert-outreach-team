@@ -3,7 +3,7 @@
 Run: `python3 tests/test_all.py` (from the project root)
 Date: 2026-09-28. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**230 passed, 0 failed.**
+**287 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -187,3 +187,26 @@ paths): company name + physical address + one-click unsubscribe link.
 `COMPANY_NAME`/`COMPANY_ADDRESS` act as defaults. Defaults: "TechXpert" and
 the obvious placeholder "REPLACE WITH YOUR BUSINESS ADDRESS"; the Settings
 page shows a warning pill until a real address is saved.
+
+## Campaign resume + delete (14)
+`POST /campaign/<id>/resume` flips a stopped campaign back to `sending` so
+the scheduler picks it up; the campaign page shows Resume instead of Stop
+while stopped. Delete is a two-step flow: `GET /campaign/<id>/delete`
+renders a confirmation page listing exactly what will be removed (campaign,
+its leads, its queued unsent items, its follow-up templates, cached AI
+drafts) and what stays (send history, notifications, other campaigns);
+`POST` only deletes when the typed name matches the campaign name exactly.
+All deletes are user-scoped. Cross-user resume/delete attempts change
+nothing (404).
+
+## Self-serve connection tests (14)
+New "Connection tests" card on Settings. `POST /settings/test-gmail` sends
+one real test email through the user's connected Gmail account, only to the
+typed address (prefilled with the login email), with dry-run on; the stored
+App Password is decrypted server-side for the SMTP login only, never shown
+or logged. Plain-language outcomes: bad address rejected, no account
+connected (links to Accounts), Gmail auth failure (reconnect guidance),
+network failure. `POST /settings/test-ai` generates a sample subject + opener
+for a fictional sample business with the stored AI key and displays the
+draft; explains setup when no key is configured. Keys never rendered.
+Buttons disable while a test runs.

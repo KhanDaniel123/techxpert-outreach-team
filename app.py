@@ -8,6 +8,7 @@ POST /api/process-queue (cron).
 """
 import io
 import os
+import smtplib
 import time
 
 from flask import Flask, request, redirect, url_for, session, render_template, jsonify, send_file
@@ -189,6 +190,96 @@ def settings():
                            company_name=company_name, company_address=company_address,
                            address_placeholder=unsubmod.address_is_placeholder(uid()),
                            placeholder_text=unsubmod.ADDRESS_PLACEHOLDER)
+
+
+# ---------------- self-serve connection tests ----------------
+
+@app.route("/settings/test-gmail", methods=["POST"])
+def settings_test_gmail():
+    """Send a real test email through the user's connected Gmail account.
+
+    This is NOT a campaign send: it only ever goes to the address the user
+    types, and it works with dry-run on. The stored App Password is decrypted
+    server-side only for the SMTP login and is never displayed or logged.
+    """
+    r = require_login()
+    if r:
+        return r
+    to_addr = (request.form.get("to_addr") or "").strip()
+    if not smtp_mail.EMAIL_RE.fullmatch(to_addr or ""):
+        return render_template("message.html", title="Test not sent",
+                               message="That does not look like a valid email address. "
+                                       "Type a real address and try again.",
+                               back=url_for("settings"), user=current_user())
+    acct = db.q("SELECT * FROM sender_accounts WHERE user_id=? AND status='active' "
+                "ORDER BY id LIMIT 1", (uid(),), one=True)
+    if not acct:
+        return render_template("message.html", title="Gmail not connected",
+                               message="No Gmail account is connected yet. Connect one on "
+                                       "the Accounts page, then run this test again.",
+                               back=url_for("accounts"), user=current_user())
+    subject = "TechXpert Outreach: Gmail connection test"
+    body = ("This is a connection test from your TechXpert Outreach app.\n\n"
+            "If you are reading this, your Gmail account is connected correctly "
+            "and the app can send through it.\n\n"
+            "No action needed. This was not sent to any lead.")
+    try:
+        smtp_mail.send_message(acct, to_addr, subject, body)
+    except smtplib.SMTPAuthenticationError:
+        return render_template("message.html", title="Gmail login failed",
+                               message="Gmail rejected the login. The App Password may have "
+                                       "changed or been revoked. Reconnect the account on the "
+                                       "Accounts page and try again.",
+                               back=url_for("accounts"), user=current_user())
+    except Exception as e:
+        return render_template("message.html", title="Could not reach Gmail",
+                               message=f"The test email could not be sent: {str(e)[:160]} "
+                                       "Check your connection and try again.",
+                               back=url_for("settings"), user=current_user())
+    return render_template("message.html", title="Test email sent",
+                           message=f"A test email is on its way to {to_addr}. "
+                                   "Check the inbox (and spam folder) in a minute.",
+                           back=url_for("settings"), user=current_user())
+
+
+SAMPLE_TEST_LEAD = {"business_name": "Sample Fitness Studio",
+                    "category": "fitness studios",
+                    "address": "Berlin, Germany",
+                    "website": "https://example.com"}
+SAMPLE_TEST_CAMPAIGN = {"niche": "fitness studios", "location": "Berlin, Germany"}
+SAMPLE_TEST_FINDINGS = ["The website has no online booking page.",
+                        "Class times are listed as a PDF download."]
+
+
+@app.route("/settings/test-ai", methods=["POST"])
+def settings_test_ai():
+    """Generate a sample subject line + opener with the stored AI key.
+
+    Uses a fictional sample business, displays the draft, never reveals the
+    key. Works with dry-run on.
+    """
+    r = require_login()
+    if r:
+        return r
+    if not config.ai_enabled():
+        return render_template("message.html", title="AI writing is off",
+                               message="No AI key is configured. Add a GEMINI_API_KEY "
+                                       "(free from Google AI Studio) or an OPENAI_API_KEY "
+                                       "in Vercel under Settings, then redeploy, and run "
+                                       "this test again. Your key is never shown in the app.",
+                               back=url_for("settings"), user=current_user())
+    try:
+        subject, body, _usage = aimod.generate_email(
+            SAMPLE_TEST_LEAD, SAMPLE_TEST_CAMPAIGN, SAMPLE_TEST_FINDINGS)
+    except Exception as e:
+        return render_template("message.html", title="AI test failed",
+                               message=f"The AI service did not return a draft: {str(e)[:160]} "
+                                       "Check the API key and try again.",
+                               back=url_for("settings"), user=current_user())
+    return render_template("test_ai_result.html", user=current_user(),
+                           model=config.ai_model_name(),
+                           sample=SAMPLE_TEST_LEAD, findings=SAMPLE_TEST_FINDINGS,
+                           subject=subject, body=body)
 
 
 # ---------------- one-click unsubscribe (public, no login) ----------------
@@ -689,6 +780,81 @@ def campaign_stop(cid):
     if _own_campaign(cid):
         db.w("UPDATE campaigns SET status='stopped' WHERE id=?", (cid,))
     return redirect(url_for("campaign", cid=cid))
+
+
+@app.route("/campaign/<int:cid>/resume", methods=["POST"])
+def campaign_resume(cid):
+    """Set a stopped campaign back to sending so the scheduler picks it up."""
+    if _own_campaign(cid):
+        db.w("UPDATE campaigns SET status='sending' WHERE id=?", (cid,))
+    return redirect(url_for("campaign", cid=cid))
+
+
+def _delete_campaign_data(cid, user_id):
+    """Remove a campaign and everything that belongs to it.
+
+    Removed: the campaign row, its leads, its queued (unsent) items,
+    its follow-up templates, and cached AI drafts for its leads.
+    Kept: send history (send_log), notifications, and job records, so the
+    past is never rewritten. Returns (leads, queued, followups) counts.
+    """
+    lead_ids = [r["id"] for r in db.q(
+        "SELECT id FROM leads WHERE campaign_id=? AND user_id=?", (cid, user_id))]
+    queued = (db.q("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=?",
+                   (cid,), one=True) or {}).get("c", 0)
+    followups = (db.q("SELECT COUNT(*) c FROM followups WHERE campaign_id=?",
+                      (cid,), one=True) or {}).get("c", 0)
+    db.w("DELETE FROM send_queue WHERE campaign_id=?", (cid,))
+    if lead_ids:
+        placeholders = ",".join("?" for _ in lead_ids)
+        db.w(f"DELETE FROM ai_content WHERE lead_id IN ({placeholders})", lead_ids)
+    db.w("DELETE FROM followups WHERE campaign_id=?", (cid,))
+    db.w("DELETE FROM leads WHERE campaign_id=? AND user_id=?", (cid, user_id))
+    db.w("DELETE FROM campaigns WHERE id=? AND user_id=?", (cid, user_id))
+    return len(lead_ids), queued, followups
+
+
+@app.route("/campaign/<int:cid>/delete", methods=["GET"])
+def campaign_delete_confirm(cid):
+    r = require_login()
+    if r:
+        return r
+    camp = _own_campaign(cid)
+    if not camp:
+        return "Campaign not found", 404
+    one = lambda sql, args=(): ((db.q(sql, args, one=True) or {}).get("c")) or 0
+    counts = {
+        "leads": one("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND user_id=?",
+                     (cid, uid())),
+        "queued": one("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=?", (cid,)),
+        "followups": one("SELECT COUNT(*) c FROM followups WHERE campaign_id=?", (cid,)),
+    }
+    return render_template("campaign_delete.html", campaign=camp, counts=counts,
+                           user=current_user(), error=None)
+
+
+@app.route("/campaign/<int:cid>/delete", methods=["POST"])
+def campaign_delete(cid):
+    r = require_login()
+    if r:
+        return r
+    camp = _own_campaign(cid)
+    if not camp:
+        return "Campaign not found", 404
+    typed = (request.form.get("confirm_name") or "").strip()
+    if typed != camp["name"]:
+        one = lambda sql, args=(): ((db.q(sql, args, one=True) or {}).get("c")) or 0
+        counts = {
+            "leads": one("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND user_id=?",
+                         (cid, uid())),
+            "queued": one("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=?", (cid,)),
+            "followups": one("SELECT COUNT(*) c FROM followups WHERE campaign_id=?", (cid,)),
+        }
+        return render_template("campaign_delete.html", campaign=camp, counts=counts,
+                               user=current_user(),
+                               error="The typed name does not match. Nothing was deleted.")
+    _delete_campaign_data(cid, uid())
+    return redirect(url_for("dashboard"))
 
 
 @app.route("/logs")

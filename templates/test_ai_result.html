@@ -1,0 +1,13 @@
+{% extends "base.html" %}{% block t %}AI test result{% endblock %}{% block b %}
+<h1>AI writer test</h1>
+<div class="card" style="max-width:680px">
+<p><small class="mut">Model: {{ model }}. Sample business: <strong>{{ sample.business_name }}</strong> ({{ sample.category }}, {{ sample.address }}). This draft was written for a fictional business, nothing was sent to anyone.</small></p>
+<p><small class="mut">Observations given to the AI:</small></p>
+<ul>{% for f in findings %}<li><small>{{ f }}</small></li>{% endfor %}</ul>
+<h2>Subject</h2>
+<p class="mono">{{ subject }}</p>
+<h2>Opener</h2>
+<p style="white-space:pre-line">{{ body }}</p>
+<p><a class="btn" href="/settings">Back to Settings</a></p>
+</div>
+{% endblock %}

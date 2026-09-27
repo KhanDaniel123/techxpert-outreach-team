@@ -156,7 +156,12 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <p>{% for s,c in qstat.items() %}<span class="pill mut">{{ s }}: {{ c }}</span> {% endfor %}{% if not qstat %}<small>Queue empty.</small>{% endif %}</p>
 <div class="actions">
 <form method="post" action="/campaign/{{ campaign.id }}/enqueue"><button type="submit">Queue selected leads &amp; start sending</button></form>
+{% if campaign.status == 'stopped' %}
+<form method="post" action="/campaign/{{ campaign.id }}/resume"><button type="submit">Resume</button></form>
+{% else %}
 <form method="post" action="/campaign/{{ campaign.id }}/stop"><button class="warn" type="submit">Stop</button></form>
+{% endif %}
+<a class="btn warn" href="/campaign/{{ campaign.id }}/delete">Delete</a>
 </div>
 <p><small>The scheduler cron processes the queue: up to 5 messages per tick per campaign, random delay spacing between ticks, only inside the window, rotating sender accounts, never exceeding caps. In dry-run mode it logs intended sends without emailing.</small></p></div>
 {% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block t %}Delete campaign{% endblock %}{% block b %}
+<h1>Delete campaign?</h1>
+<div class="card" style="max-width:640px">
+<p>You are about to permanently delete <strong>{{ campaign.name }}</strong>. This cannot be undone.</p>
+<p><strong>This will permanently remove:</strong></p>
+<ul>
+<li>The campaign and all of its settings</li>
+<li>{{ counts.leads }} lead{{ 's' if counts.leads != 1 }} in this campaign</li>
+<li>{{ counts.queued }} queued (unsent) email{{ 's' if counts.queued != 1 }} for this campaign</li>
+<li>{{ counts.followups }} follow-up template{{ 's' if counts.followups != 1 }}</li>
+<li>Saved AI drafts for this campaign's leads</li>
+</ul>
+<p><strong>This will NOT remove:</strong> the history of emails already sent (the send log), notifications, or anything belonging to your other campaigns.</p>
+{% if error %}<p><span class="pill bad">{{ error }}</span></p>{% endif %}
+<form method="post" action="/campaign/{{ campaign.id }}/delete">
+<p><label><small>Type the campaign name exactly to confirm: <span class="mono">{{ campaign.name }}</span></small></label><br>
+<input type="text" name="confirm_name" autocomplete="off" style="width:100%;max-width:420px" placeholder="{{ campaign.name }}"></p>
+<p><button class="warn" type="submit">Delete this campaign forever</button>
+<a class="btn ghost" href="/campaign/{{ campaign.id }}">Cancel</a></p>
+</form>
+</div>
+{% endblock %}
