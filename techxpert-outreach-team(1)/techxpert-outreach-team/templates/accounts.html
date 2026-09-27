@@ -1,0 +1,21 @@
+{% extends "base.html" %}{% block t %}Gmail accounts{% endblock %}{% block b %}
+<h1>Gmail accounts</h1>
+<div class="card">
+{% if oauth_ready %}<a class="btn" href="/oauth/start">+ Connect a Gmail account</a>
+{% else %}<p><span class="pill bad">OAuth not configured</span></p>
+<p><small>Set <span class="mono">GOOGLE_CLIENT_ID</span> and <span class="mono">GOOGLE_CLIENT_SECRET</span> env vars (steps in README), then redeploy.</small></p>{% endif %}
+<p><small>Sending rotates across all <b>active</b> accounts. Each account has its own daily cap and warmup schedule. Tokens are encrypted at rest.</small></p></div>
+{% for a in accounts %}<div class="card">
+<h2>{{ a.email }} <span class="pill {{ 'ok' if a.status=='active' else 'bad' }}">{{ a.status }}</span></h2>
+<div class="row"><div><b>Effective cap today:</b> {{ a.eff_cap }}/day <small>(configured {{ a.daily_cap }}, warmup day {{ a.age_days }}/21{{ ', warmup off' if not a.warmup_enabled }})</small></div>
+<div><b>Sent today:</b> {{ a.sent_today }}</div></div>
+<form method="post" action="/account/{{ a.id }}/cap"><div class="row" style="margin-top:10px">
+<div><label><small>Daily cap</small></label><input type="number" name="daily_cap" value="{{ a.daily_cap }}" min="1" max="500"></div>
+<div><label><small>Warmup</small></label><br><input type="checkbox" name="warmup_enabled" value="1" {{ 'checked' if a.warmup_enabled }} style="width:auto"> <small>ramp 5/day to cap over ~21 days</small></div>
+<div><br><button type="submit">Save</button></div></div></form>
+<div style="margin-top:10px;display:flex;gap:8px">
+{% if a.status=='active' %}<form method="post" action="/account/{{ a.id }}/pause"><button class="warn" type="submit">Pause</button></form>
+{% else %}<form method="post" action="/account/{{ a.id }}/resume"><button type="submit">Resume</button></form>{% endif %}
+<form method="post" action="/account/{{ a.id }}/bounces"><button class="ghost" type="submit">Scan bounces now</button></form>
+</div></div>{% else %}<div class="card"><small>No accounts connected yet.</small></div>{% endfor %}
+{% endblock %}

@@ -1,0 +1,22 @@
+{% extends "base.html" %}{% block t %}Dashboard{% endblock %}{% block b %}
+<h1>Dashboard</h1>
+{% if missing %}<div class="card"><p><span class="pill bad">Setup incomplete</span></p>
+<p><small>Missing env vars: {{ missing|join(', ') }}. The app runs, but Gmail connect and the cron endpoint need these. See README.</small></p></div>{% endif %}
+<div class="card"><h2>Queue processor</h2>
+<p><small>Sending and background jobs run when the scheduler cron hits <span class="mono">/api/process-queue</span>. For local testing you can trigger one tick manually:</small></p>
+<form method="post" action="/api/process-now"><button class="ghost" type="submit">Process queue now (one tick)</button></form></div>
+<div class="row">
+<div class="card"><h2>Send log summary</h2>
+{% for s,c in stats.items() %}<span class="pill {{ 'ok' if s=='sent' else 'mut' }}">{{ s }}: {{ c }}</span> {% endfor %}
+{% if not stats %}<small>No sends yet.</small>{% endif %}</div>
+<div class="card"><h2>Gmail accounts</h2>
+{% for a in accounts %}<div>{{ a.email }} <span class="pill {{ 'ok' if a.status=='active' else 'bad' }}">{{ a.status }}</span></div>{% else %}<small>None connected. <a href="/accounts">Connect one</a>.</small>{% endfor %}</div>
+</div>
+<div class="card"><h2>Campaigns</h2>
+<p><a class="btn" href="/campaign/new">+ New campaign</a></p>
+<table><tr><th>Name</th><th>Niche</th><th>Location</th><th>Status</th><th>Dry-run</th><th></th></tr>
+{% for c in campaigns %}<tr><td>{{ c.name }}</td><td>{{ c.niche }}</td><td>{{ c.location }}</td>
+<td><span class="pill mut">{{ c.status }}</span></td><td>{{ 'yes' if c.dry_run else 'no' }}</td>
+<td><a href="/campaign/{{ c.id }}">Open</a></td></tr>
+{% else %}<tr><td colspan="6"><small>No campaigns yet.</small></td></tr>{% endfor %}</table></div>
+{% endblock %}

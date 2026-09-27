@@ -1,0 +1,59 @@
+{% extends "base.html" %}{% block t %}{{ campaign.name }}{% endblock %}{% block b %}
+<h1>{{ campaign.name }} <span class="pill mut">{{ campaign.status }}</span>
+{% if campaign.dry_run %}<span class="pill ok">DRY-RUN</span>{% else %}<span class="pill bad">LIVE</span>{% endif %}</h1>
+<p><small>{{ campaign.niche }} | {{ campaign.location }} | delays {{ campaign.delay_min }}-{{ campaign.delay_max }}s | window {{ campaign.window_start }}-{{ campaign.window_end }} (server time, UTC on Vercel)</small></p>
+
+<div class="card"><h2>Leads ({{ leads|length }})</h2>
+<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+<form method="post" action="/campaign/{{ campaign.id }}/import" enctype="multipart/form-data">
+<input type="file" name="csvfile" accept=".csv" required style="width:auto"><button type="submit">Import CSV</button></form>
+<form method="post" action="/campaign/{{ campaign.id }}/sample"><button class="ghost" type="submit">Load sample leads</button></form>
+<form method="post" action="/campaign/{{ campaign.id }}/websearch"><button class="ghost" type="submit">Find leads (web search)</button></form>
+<form method="post" action="/campaign/{{ campaign.id }}/enrich"><button class="ghost" type="submit">Run enrichment (find emails)</button></form>
+<form method="post" action="/campaign/{{ campaign.id }}/validate"><button class="ghost" type="submit" title="Re-run email validation on selected leads">Validate emails</button></form>
+</div>
+{% if job %}<p><small>Last job [{{ job.kind }}]: <span class="pill {{ 'ok' if job.status=='done' else ('bad' if job.status=='failed' else 'mut') }}">{{ job.status }}</span> {{ job.done }}/{{ job.total }} {{ job.result }}</small>
+{% if job.status=='running' %} <button class="ghost" onclick="location.reload()">Refresh</button>{% endif %}</p>
+<p><small>Jobs run in chunks on each scheduler tick (<span class="mono">/api/process-queue</span>). Hit "Process queue now" on the dashboard, or wait for the cron.</small></p>{% endif %}
+<form method="post" action="/campaign/{{ campaign.id }}/add_lead"><div class="row">
+<div><input name="business_name" placeholder="Business name"></div>
+<div><input name="website" placeholder="Website"></div>
+<div><input name="email" placeholder="Email"></div>
+<div><input name="phone" placeholder="Phone"></div>
+<div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
+<table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Email verdict</th><th>Form?</th><th>Notes</th></tr>
+{% for l in leads %}<tr>
+<td><form method="post" action="/campaign/{{ campaign.id }}/toggle_lead">
+<input type="hidden" name="lead_id" value="{{ l.id }}">
+<input type="checkbox" name="selected" {{ 'checked' if l.selected }} onchange="this.form.submit()" style="width:auto"></form></td>
+<td>{{ l.business_name }}</td><td class="mono">{{ l.phone }}</td>
+<td>{% if l.website %}<a href="{{ l.website }}" target="_blank">site</a>{% endif %}</td>
+<td class="mono">{{ l.email }}</td>
+<td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
+<td>{{ 'yes' if l.has_contact_form else '' }}</td>
+<td><small>{{ l.notes }}</small></td></tr>
+{% else %}<tr><td colspan="8"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div>
+
+<div class="card"><h2>Message template</h2>
+<form method="post" action="/campaign/{{ campaign.id }}/template">
+<p><label><small>Subject</small></label><input name="subject_tpl" value="{{ campaign.subject_tpl }}"></p>
+<p><label><small>Body (variables: {business_name} {phone} {website} {category} / spintax: {a|b})</small></label>
+<textarea name="body_tpl" rows="7">{{ campaign.body_tpl }}</textarea></p>
+<div class="row">
+<div><label><small>Delay min (s)</small></label><input type="number" name="delay_min" value="{{ campaign.delay_min }}"></div>
+<div><label><small>Delay max (s)</small></label><input type="number" name="delay_max" value="{{ campaign.delay_max }}"></div>
+<div><label><small>Window start (server time)</small></label><input type="time" name="window_start" value="{{ campaign.window_start }}"></div>
+<div><label><small>Window end (server time)</small></label><input type="time" name="window_end" value="{{ campaign.window_end }}"></div></div>
+<p><label><input type="checkbox" name="dry_run" {{ 'checked' if campaign.dry_run }} style="width:auto"> Dry-run mode (log, don't send)</label></p>
+<p><button type="submit">Save template</button>
+<button type="button" class="ghost" onclick="fetch('/campaign/{{ campaign.id }}/preview',{method:'POST'}).then(r=>r.json()).then(j=>alert('TO: '+j.to+'\nSUBJECT: '+j.subject+'\n\n'+j.body))">Preview render</button></p>
+</form></div>
+
+<div class="card"><h2>Send queue</h2>
+<p>{% for s,c in qstat.items() %}<span class="pill mut">{{ s }}: {{ c }}</span> {% endfor %}{% if not qstat %}<small>Queue empty.</small>{% endif %}</p>
+<div style="display:flex;gap:8px">
+<form method="post" action="/campaign/{{ campaign.id }}/enqueue"><button type="submit">Queue selected leads &amp; start sending</button></form>
+<form method="post" action="/campaign/{{ campaign.id }}/stop"><button class="warn" type="submit">Stop</button></form>
+</div>
+<p><small>The scheduler cron processes the queue: up to 5 messages per tick per campaign, random delay spacing between ticks, only inside the window, rotating Gmail accounts, never exceeding caps. In dry-run mode it logs intended sends without emailing.</small></p></div>
+{% endblock %}
