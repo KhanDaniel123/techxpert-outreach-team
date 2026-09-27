@@ -130,6 +130,9 @@ leads = Table("leads", metadata,
               # replied=1: lead replied (via IMAP reply scan); sequence stops
               Column("handled", Integer, nullable=False, server_default="0"),
               # handled=1: user marked the replied lead handled; hidden from the hot list
+              Column("unsubscribed", Integer, nullable=False, server_default="0"),
+              # unsubscribed=1: lead opted out via the one-click unsubscribe
+              # link; never queued or mailed again (same as reply/bounce guards)
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
@@ -213,6 +216,17 @@ notifications = Table("notifications", metadata,
                       Column("read_at", Float, nullable=True))
 
 
+# Per-user compliance settings for the cold-email footer: company name and
+# physical address, editable on the Settings page. Env vars COMPANY_NAME /
+# COMPANY_ADDRESS in config.py act as defaults when a row/field is unset.
+user_settings = Table("user_settings", metadata,
+                      Column("user_id", Integer, primary_key=True),
+                      Column("company_name", Text, default=""),
+                      Column("company_address", Text, default=""),
+                      Column("updated_at", Float, nullable=False,
+                             server_default="0"))
+
+
 def init_db():
     # CREATE TABLE IF NOT EXISTS under the hood; safe to run on every boot,
     # including against a database created by the previous Google-OAuth version.
@@ -246,13 +260,15 @@ def _migrate():
                   "personalized_line TEXT",
                   "handled INTEGER DEFAULT 0",
                   "ai_status TEXT DEFAULT ''",
-                  "ai_note TEXT DEFAULT ''"],
+                  "ai_note TEXT DEFAULT ''",
+                  "unsubscribed INTEGER DEFAULT 0"],
     }
     for table, cols in want.items():
         for ddl in cols:
             _add_column(table, ddl)
     _ensure_notifications_table()
     _ensure_ai_content_table()
+    _ensure_user_settings_table()
 
 
 def _ensure_notifications_table():
@@ -292,6 +308,22 @@ def _ensure_ai_content_table():
         if IS_POSTGRES:
             ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
                               "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
+
+
+def _ensure_user_settings_table():
+    """Idempotent CREATE TABLE for per-user compliance settings (covers
+    databases that predate the table; create_all() covers fresh DBs)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS user_settings ("
+               "user_id INTEGER PRIMARY KEY, "
+               "company_name TEXT DEFAULT '', "
+               "company_address TEXT DEFAULT '', "
+               "updated_at FLOAT NOT NULL DEFAULT 0)")
         with engine.begin() as con:
             con.execute(text(ddl))
     except Exception:
@@ -381,3 +413,22 @@ def create_user(email, name, password_hash):
     wid = w("INSERT INTO app_users (email, name, password_hash, created_at) VALUES (?,?,?,?)",
             (email, name or "", password_hash, time.time()))
     return q("SELECT * FROM app_users WHERE id=?", (wid,), one=True)
+
+
+# ---------------- per-user compliance settings (email footer) ----------------
+
+def get_user_settings(uid):
+    """Return the user's compliance settings row, or None when unset."""
+    return q("SELECT * FROM user_settings WHERE user_id=?", (uid,), one=True)
+
+
+def save_user_settings(uid, company_name, company_address):
+    """Upsert the user's company name + physical address for the footer."""
+    existing = get_user_settings(uid)
+    if existing:
+        w("UPDATE user_settings SET company_name=?, company_address=?, updated_at=? WHERE user_id=?",
+          (company_name or "", company_address or "", time.time(), uid))
+    else:
+        w("INSERT INTO user_settings (user_id, company_name, company_address, updated_at) VALUES (?,?,?,?)",
+          (uid, company_name or "", company_address or "", time.time()))
+    return get_user_settings(uid)

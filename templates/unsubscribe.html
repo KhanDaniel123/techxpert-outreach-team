@@ -1,0 +1,11 @@
+{% extends "base.html" %}{% block t %}Unsubscribe{% endblock %}{% block b %}
+<div class="card" style="max-width:560px;margin:8vh auto;text-align:center">
+{% if ok %}
+<h1>You've been unsubscribed</h1>
+<p>You won't receive any more emails from us. If this was a mistake, just reply to any previous email and we'll sort it out.</p>
+{% else %}
+<h1>That link didn't work</h1>
+<p>This unsubscribe link is invalid or has expired. Nothing was changed. If you'd like to opt out, reply to any email from us with "unsubscribe" and we'll remove you right away.</p>
+{% endif %}
+</div>
+{% endblock %}

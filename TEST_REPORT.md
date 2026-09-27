@@ -161,3 +161,29 @@ so it survives restarts (verified across real ticks). `DISCOVER_PER_TICK`
 raised from 5 to 8. Each tick logs the query variant used. The existing
 `discovery_verdict` junk filter is unchanged and still applied to every
 result.
+
+## Unsubscribe + compliance footer (29)
+New `unsubscribe.py`: `signed_token(lead_id, user_id)` mints an opaque
+Fernet-encrypted token (same key as the stored Gmail App Passwords via
+`crypto.py`); `verify_token` rejects forged/tampered tokens, expired tokens
+(2-year max age), tokens for unknown leads, and tokens whose lead belongs to
+a different user. Tokens are non-deterministic (random IV), so leads cannot
+be enumerated. Public route `GET /unsubscribe?t=<token>` (no login) marks
+the lead unsubscribed and renders a confirmation page; invalid/expired tokens
+get a safe error page (400) and flip nothing. `leads.unsubscribed` column
+added (Table + idempotent migration in `db.py`). Guards, same style as the
+reply/bounce guards: `enqueue_campaign` excludes unsubscribed leads,
+`pipeline._queue` skips them, `sender.sequence_gate` stops follow-ups, and
+`queue_worker._process_campaign` drops queue items for leads that
+unsubscribed after being queued (marked failed, never mailed, nothing in
+send_log). Every outgoing campaign email and follow-up gets a plain-text
+footer in `sender.send_one` (post-render, so it covers AI and template
+paths): company name + physical address + one-click unsubscribe link.
+`smtp_mail.build_message`/`send_message` accept `list_unsub_url` and set
+`List-Unsubscribe: <url>` + `List-Unsubscribe-Post: List-Unsubscribe=One-Click`
+(RFC 2369/8058). Company name/address are per-user Settings
+(`user_settings` table, `db.get_user_settings`/`save_user_settings`,
+`GET/POST /settings`, `templates/settings.html`); env vars
+`COMPANY_NAME`/`COMPANY_ADDRESS` act as defaults. Defaults: "TechXpert" and
+the obvious placeholder "REPLACE WITH YOUR BUSINESS ADDRESS"; the Settings
+page shows a warning pill until a real address is saved.

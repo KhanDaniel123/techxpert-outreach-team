@@ -481,6 +481,7 @@ def _queue(camp):
     rows = db.q(
         """SELECT l.* FROM leads l WHERE l.campaign_id=? AND l.selected=1
            AND l.email<>'' AND l.email_verdict IN ('valid','risky') AND l.replied=0
+           AND l.unsubscribed=0
            AND NOT EXISTS (SELECT 1 FROM send_queue q
                            WHERE q.campaign_id=l.campaign_id AND q.lead_id=l.id)
            AND NOT EXISTS (SELECT 1 FROM send_log s

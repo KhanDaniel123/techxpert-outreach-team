@@ -24,6 +24,7 @@ import queue_worker
 import jobs as jobsmod
 import ai_writer as aimod
 import pipeline as pipelinemod
+import unsubscribe as unsubmod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -163,13 +164,36 @@ def lead_handled(lid):
     return redirect(url_for("dashboard"))
 
 
-@app.route("/settings")
+@app.route("/settings", methods=["GET", "POST"])
 def settings():
     r = require_login()
     if r:
         return r
+    if request.method == "POST":
+        name = (request.form.get("company_name") or "").strip()
+        addr = (request.form.get("company_address") or "").strip()
+        db.save_user_settings(uid(), name, addr)
+        return redirect(url_for("settings"))
+    company_name, company_address = unsubmod.get_company_info(uid())
     return render_template("settings.html", user=current_user(),
-                           ai_on=config.ai_enabled(), ai_model=config.ai_model_name())
+                           ai_on=config.ai_enabled(), ai_model=config.ai_model_name(),
+                           company_name=company_name, company_address=company_address,
+                           address_placeholder=unsubmod.address_is_placeholder(uid()),
+                           placeholder_text=unsubmod.ADDRESS_PLACEHOLDER)
+
+
+# ---------------- one-click unsubscribe (public, no login) ----------------
+
+@app.route("/unsubscribe")
+def unsubscribe():
+    """Public one-click unsubscribe. The signed token identifies the lead;
+    no login is required (recipients are not app users)."""
+    token = (request.args.get("t") or "").strip()
+    info = unsubmod.verify_token(token)
+    if not info:
+        return render_template("unsubscribe.html", ok=False), 400
+    unsubmod.mark_unsubscribed(info["lead_id"], info["user_id"])
+    return render_template("unsubscribe.html", ok=True)
 
 
 # ---------------- sender accounts (Gmail SMTP via App Password) ----------------

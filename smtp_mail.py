@@ -43,13 +43,27 @@ def _decrypt(account):
     return crypto.decrypt_token(account["password_enc"])
 
 
-def send_message(account, to_addr, subject, body):
-    """Send one plain-text email via Gmail SMTP. Raises on failure."""
-    password = _decrypt(account)
+def build_message(account, to_addr, subject, body, list_unsub_url=None):
+    """Build the MIME message for one outgoing email.
+
+    list_unsub_url: full one-click unsubscribe URL. When present, sets
+    List-Unsubscribe and List-Unsubscribe-Post (RFC 2369 / RFC 8058) so
+    Gmail and other providers show a native Unsubscribe button.
+    """
     msg = MIMEText(body or "", "plain", "utf-8")
     msg["From"] = account["email"]
     msg["To"] = to_addr
     msg["Subject"] = subject or ""
+    if list_unsub_url:
+        msg["List-Unsubscribe"] = f"<{list_unsub_url}>"
+        msg["List-Unsubscribe-Post"] = "List-Unsubscribe=One-Click"
+    return msg
+
+
+def send_message(account, to_addr, subject, body, list_unsub_url=None):
+    """Send one plain-text email via Gmail SMTP. Raises on failure."""
+    password = _decrypt(account)
+    msg = build_message(account, to_addr, subject, body, list_unsub_url)
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
         s.ehlo()
         s.starttls()

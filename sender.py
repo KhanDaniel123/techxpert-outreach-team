@@ -207,6 +207,8 @@ def sequence_gate(user_id, campaign_id, lead, step):
         return False, "Follow-ups are disabled for this campaign."
     if lead.get("replied"):
         return False, "Lead replied; sequence stopped."
+    if lead.get("unsubscribed"):
+        return False, "Lead unsubscribed; sequence stopped."
     bounced = db.q(
         "SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? AND status='bounced' LIMIT 1",
         (campaign_id, lead["id"]), one=True)
@@ -332,6 +334,16 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
     recipient = (lead["email"] or "").strip()
     if not recipient:
         return {"ok": False, "reason": "no_email", "detail": "Lead has no email address."}
+    if lead.get("unsubscribed"):
+        return {"ok": False, "reason": "unsubscribed",
+                "detail": "Lead unsubscribed; never mailed again."}
+
+    # Compliance footer on every outgoing campaign email and follow-up:
+    # company name + physical address + one-click unsubscribe link.
+    import unsubscribe as _unsub
+    footer = _unsub.build_footer(user_id, lead["id"])
+    body = body + footer
+    list_unsub_url = _unsub.unsubscribe_url(lead["id"], user_id)
 
     intended_delay = rng.randint(campaign["delay_min"], campaign["delay_max"])
 
@@ -346,7 +358,8 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
     try:
         if send_fn is None:
             import smtp_mail
-            smtp_mail.send_message(account, recipient, subject, body)
+            smtp_mail.send_message(account, recipient, subject, body,
+                                   list_unsub_url=list_unsub_url)
         else:
             send_fn(account, recipient, subject, body)
         record_send(user_id, campaign["id"], account["id"], lead["id"],

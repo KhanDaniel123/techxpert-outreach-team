@@ -14,6 +14,7 @@ import os
 import re
 import sys
 import time
+import json
 from unittest import mock
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -1426,6 +1427,133 @@ with mock.patch("scrapers.websearch.ddg_links", return_value=[]), \
         db.q("SELECT * FROM campaigns WHERE id=?", (campQ,), one=True))
 check("rotation index persists in cursor",
       cur1.get("q") == 1 and cur2.get("q") == 2, f"{cur1} {cur2}")
+
+# ================= 14. Unsubscribe + compliance footer =================
+import unsubscribe as unsubmod
+
+uu = make_user("unsub@example.com")
+c_unsub = login_client("unsub@example.com")
+add_account(uu["id"], "sender-unsub@gmail.com")
+campU = make_campaign(c_unsub, "UnsubCamp", dry_run=0)
+lidU = add_lead(campU, uu["id"], "lead@example.com", "LeadBiz")
+
+# token sign/verify round-trip
+tok = unsubmod.signed_token(lidU, uu["id"])
+check("token round-trip verifies",
+      unsubmod.verify_token(tok) == {"lead_id": lidU, "user_id": uu["id"]})
+
+# forged / malformed tokens rejected
+forged = tok[:-4] + ("AAAA" if not tok.endswith("AAAA") else "BBBB")
+check("tampered token rejected", unsubmod.verify_token(forged) is None)
+check("empty token rejected", unsubmod.verify_token("") is None)
+check("garbage token rejected", unsubmod.verify_token("not-a-token") is None)
+
+# expired token rejected (crafted with an old timestamp)
+old_payload = json.dumps({"lead_id": lidU, "user_id": uu["id"],
+                          "ts": time.time() - 800 * 86400})
+check("expired token rejected",
+      unsubmod.verify_token(cryptomod.encrypt_token(old_payload)) is None)
+
+# token for an unknown lead rejected; tokens are opaque (no lead identifiers
+# inside) and non-deterministic (random IV, so no enumeration by guessing)
+check("token for unknown lead rejected",
+      unsubmod.verify_token(unsubmod.signed_token(999999, uu["id"])) is None)
+check("token is opaque", "lead@example.com" not in tok and "LeadBiz" not in tok)
+check("tokens are non-deterministic",
+      unsubmod.signed_token(lidU, uu["id"]) != unsubmod.signed_token(lidU, uu["id"]))
+
+# public unsubscribe route flips the flag, no login needed
+anon = appmod.app.test_client()
+r = anon.get("/unsubscribe", query_string={"t": tok})
+check("unsubscribe route 200 + confirmation page",
+      r.status_code == 200 and b"You've been unsubscribed" in r.data)
+check("unsubscribe route flips flag",
+      db.q("SELECT unsubscribed FROM leads WHERE id=?", (lidU,), one=True)["unsubscribed"] == 1)
+
+# invalid token: safe error page, nothing flipped
+lidU2 = add_lead(campU, uu["id"], "lead2@example.com", "LeadBiz2")
+r = anon.get("/unsubscribe", query_string={"t": "bogus"})
+check("invalid token shows safe error page",
+      r.status_code == 400 and b"didn't work" in r.data)
+check("invalid token flips nothing",
+      db.q("SELECT unsubscribed FROM leads WHERE id=?", (lidU2,), one=True)["unsubscribed"] == 0)
+
+# unsubscribed lead is never queued
+n = queue_worker.enqueue_campaign(uu["id"], campU)
+queued_ids = [x["lead_id"] for x in
+              db.q("SELECT lead_id FROM send_queue WHERE campaign_id=?", (campU,))]
+check("unsubscribed lead excluded from enqueue",
+      lidU not in queued_ids and lidU2 in queued_ids, f"queued={queued_ids}")
+
+# sequence_gate stops follow-ups for unsubscribed leads
+leadU = db.q("SELECT * FROM leads WHERE id=?", (lidU,), one=True)
+allowed, reason = sender.sequence_gate(uu["id"], campU, leadU, 1)
+check("sequence_gate blocks unsubscribed",
+      not allowed and "nsubscrib" in reason, reason)
+
+# queue item for a lead that unsubscribes AFTER being queued is dropped, never mailed
+db.w("UPDATE leads SET unsubscribed=1 WHERE id=?", (lidU2,))
+db.w("UPDATE campaigns SET status='sending', next_send_at=0 WHERE id=?", (campU,))
+campU_row = db.q("SELECT * FROM campaigns WHERE id=?", (campU,), one=True)
+outcomes = queue_worker._process_campaign(campU_row, time.time())
+qitem = db.q("SELECT status, last_error FROM send_queue WHERE campaign_id=? AND lead_id=?",
+             (campU, lidU2), one=True)
+check("queued-then-unsubscribed item failed, never sent",
+      qitem["status"] == "failed" and "nsubscrib" in (qitem["last_error"] or ""))
+check("no send logged for unsubscribed lead",
+      not db.q("SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? AND status='sent'",
+               (campU, lidU2)))
+
+# footer present in the composed email (fake send_fn captures the body)
+campF = make_campaign(c_unsub, "FootCamp", dry_run=0)
+db.w("UPDATE campaigns SET subject_tpl='Hi {business_name}', body_tpl='Hello {business_name}' WHERE id=?",
+     (campF,))
+lidF = add_lead(campF, uu["id"], "foot@example.com", "FootBiz")
+captured = {}
+def _fake_send(account, to, subject, body):
+    captured.update(to=to, subject=subject, body=body)
+    return True
+out = sender.send_one(uu["id"],
+                      db.q("SELECT * FROM campaigns WHERE id=?", (campF,), one=True),
+                      db.q("SELECT * FROM leads WHERE id=?", (lidF,), one=True),
+                      send_fn=_fake_send)
+check("composed email reports ok", out.get("ok") is True)
+fbody = captured.get("body", "")
+check("footer carries company name", "TechXpert" in fbody)
+check("footer carries unsubscribe link", "/unsubscribe?t=" in fbody)
+tok_in_footer = fbody.split("/unsubscribe?t=")[1].split()[0]
+check("footer link token verifies",
+      unsubmod.verify_token(tok_in_footer) == {"lead_id": lidF, "user_id": uu["id"]})
+
+# List-Unsubscribe headers on outgoing mail
+m1 = smtp_mail.build_message({"email": "a@b.c"}, "x@y.z", "s", "b",
+                             list_unsub_url="https://app.example/unsubscribe?t=abc")
+check("List-Unsubscribe header set",
+      m1["List-Unsubscribe"] == "<https://app.example/unsubscribe?t=abc>")
+check("List-Unsubscribe-Post header set",
+      m1["List-Unsubscribe-Post"] == "List-Unsubscribe=One-Click")
+m2 = smtp_mail.build_message({"email": "a@b.c"}, "x@y.z", "s", "b")
+check("no unsub headers without url", m2["List-Unsubscribe"] is None)
+
+# footer settings: save via POST, placeholder warning behavior
+r = c_unsub.post("/settings",
+                 data={"company_name": "Acme Co",
+                       "company_address": "1 Main St, Berlin"},
+                 follow_redirects=False)
+check("settings POST redirects", r.status_code == 302)
+nm, ad = unsubmod.get_company_info(uu["id"])
+check("footer settings saved", nm == "Acme Co" and ad == "1 Main St, Berlin")
+check("placeholder warning clears after save",
+      not unsubmod.address_is_placeholder(uu["id"]))
+r = c_unsub.get("/settings")
+check("settings page renders saved values",
+      r.status_code == 200 and b"Acme Co" in r.data)
+fresh = make_user("fresh-addr@example.com")
+check("fresh user gets placeholder warning",
+      unsubmod.address_is_placeholder(fresh["id"]))
+nm0, ad0 = unsubmod.get_company_info(fresh["id"])
+check("defaults are TechXpert + placeholder",
+      nm0 == "TechXpert" and ad0 == unsubmod.ADDRESS_PLACEHOLDER)
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:

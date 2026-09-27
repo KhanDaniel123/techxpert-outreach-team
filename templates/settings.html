@@ -8,4 +8,22 @@
 <p><small>AI writing is off. To turn it on, add a <span class="mono">GEMINI_API_KEY</span> (free from Google AI Studio) or an <span class="mono">OPENAI_API_KEY</span> in Vercel under Settings &gt; Environment Variables, then redeploy. Everything else works normally without it. Your key is never shown anywhere in the app.</small></p>
 {% endif %}
 </div>
+<div class="card"><h2>Email footer (required before real sending)</h2>
+<p><small>Every campaign email ends with your company name, physical address, and a one-click unsubscribe link. Cold email without this can get your Gmail flagged or break spam law, so set a real address before turning off dry-run.</small></p>
+{% if address_placeholder %}
+<p><span class="pill bad">Address not set</span> <small>The footer currently shows a placeholder. Replace it below.</small></p>
+{% endif %}
+<form method="post" action="/settings">
+<div style="margin-bottom:12px"><label><small>Company name</small></label><br>
+<input type="text" name="company_name" value="{{ company_name }}" style="width:100%;max-width:420px" maxlength="120"></div>
+<div style="margin-bottom:12px"><label><small>Business address (street, city, country)</small></label><br>
+<input type="text" name="company_address" value="{% if not address_placeholder %}{{ company_address }}{% endif %}" placeholder="{{ placeholder_text }}" style="width:100%;max-width:420px" maxlength="240"></div>
+<button type="submit">Save footer settings</button>
+</form>
+<p><small>Preview of what recipients see at the bottom of every email:</small></p>
+<p class="mono" style="white-space:pre-line"><small>--
+{{ company_name }}
+{{ company_address }}
+Unsubscribe: {{ request.host_url.rstrip('/') }}/unsubscribe?t=...</small></p>
+</div>
 {% endblock %}

@@ -48,6 +48,14 @@ AI_PRICE_OUT_PER_M = 0.60  # USD per million output tokens (approx)
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() \
     or "gemini-2.0-flash"
 
+# Compliance footer defaults for cold email (CAN-SPAM style: company name +
+# physical address + one-click unsubscribe). Per-user values set on the
+# Settings page override these; env vars override the built-ins below.
+COMPANY_NAME = os.environ.get("COMPANY_NAME", "TechXpert").strip() or "TechXpert"
+COMPANY_ADDRESS = os.environ.get(
+    "COMPANY_ADDRESS", "REPLACE WITH YOUR BUSINESS ADDRESS").strip() \
+    or "REPLACE WITH YOUR BUSINESS ADDRESS"
+
 
 def ai_provider():
     """Which AI backend to use: 'gemini', 'openai', or None.

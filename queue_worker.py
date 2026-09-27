@@ -31,9 +31,11 @@ MAX_RUN_SECONDS = 50  # stay well under serverless time limits
 
 
 def enqueue_campaign(user_id, campaign_id):
-    """Queue every selected lead with an email for a campaign."""
+    """Queue every selected lead with an email for a campaign.
+
+    Unsubscribed leads are never queued (same as the reply/bounce guards)."""
     leads = db.q(
-        "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>''",
+        "SELECT * FROM leads WHERE campaign_id=? AND selected=1 AND email<>'' AND unsubscribed=0",
         (campaign_id,))
     now = time.time()
     n = 0
@@ -136,6 +138,16 @@ def _process_campaign(camp, now_ts, send_fn=None):
         if not lead:
             db.w("UPDATE send_queue SET status='failed', last_error=? WHERE id=?",
                  ("lead missing", item["id"]))
+            continue
+        if lead.get("unsubscribed"):
+            # Belt-and-suspenders: a lead unsubscribed after being queued is
+            # dropped here too, never mailed again.
+            step = item["step"] or 0
+            db.w("UPDATE send_queue SET status='failed', last_error=? WHERE id=?",
+                 ("Lead unsubscribed; never mailed again.", item["id"]))
+            outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
+                             "to": lead["email"], "step": step,
+                             "detail": "Lead unsubscribed; never mailed again."})
             continue
         step = item["step"] or 0
         if not sender.in_window(camp, datetime.now()):
