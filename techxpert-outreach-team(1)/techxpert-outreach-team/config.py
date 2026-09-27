@@ -15,6 +15,10 @@ Optional:
     OPENAI_API_KEY  - enables Autopilot (AI-written emails). Without it the
                       autopilot toggle is hidden and the app works exactly as
                       before. The key is never displayed in the UI.
+    GEMINI_API_KEY  - same as OPENAI_API_KEY but uses Google's Gemini through
+                      its OpenAI-compatible endpoint instead. Free from Google
+                      AI Studio. If both keys are set, Gemini is preferred.
+    GEMINI_MODEL    - overrides the default Gemini model name.
 
 There is deliberately NO Google OAuth here. Login is built-in
 email + password (auth.py); sending is direct Gmail SMTP with per-user
@@ -28,6 +32,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL", "")
 FERNET_KEY = os.environ.get("FERNET_KEY", "")
 CRON_SECRET = os.environ.get("CRON_SECRET", "")
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 
 # Autopilot AI model. Cheap and fast; the model name is a constant so a
 # future swap is one line. Pricing (approx, check openai.com/pricing):
@@ -37,10 +42,33 @@ AI_MODEL = "gpt-4o-mini"
 AI_PRICE_IN_PER_M = 0.15   # USD per million input tokens (approx)
 AI_PRICE_OUT_PER_M = 0.60  # USD per million output tokens (approx)
 
+# Gemini model, env-overridable. gemini-2.0-flash is cheap and fast and
+# speaks the OpenAI-compatible chat-completions dialect below. Gemini's
+# free tier covers this app's volume, so cost is reported as zero.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() \
+    or "gemini-2.0-flash"
+
+
+def ai_provider():
+    """Which AI backend to use: 'gemini', 'openai', or None.
+
+    Gemini is preferred when both keys are set, because the user asked
+    for it and its free tier covers this volume."""
+    if GEMINI_API_KEY:
+        return "gemini"
+    if OPENAI_API_KEY:
+        return "openai"
+    return None
+
+
+def ai_model_name():
+    """Display name of the model the Autopilot writer will use."""
+    return GEMINI_MODEL if ai_provider() == "gemini" else AI_MODEL
+
 
 def ai_enabled():
     """Is AI writing available? Never expose the key itself."""
-    return bool(OPENAI_API_KEY)
+    return ai_provider() is not None
 
 # Stable session secret derived from FERNET_KEY so logins survive across
 # serverless invocations (a random key would log everyone out on each cold start).

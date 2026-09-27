@@ -169,7 +169,7 @@ def settings():
     if r:
         return r
     return render_template("settings.html", user=current_user(),
-                           ai_on=config.ai_enabled(), ai_model=config.AI_MODEL)
+                           ai_on=config.ai_enabled(), ai_model=config.ai_model_name())
 
 
 # ---------------- sender accounts (Gmail SMTP via App Password) ----------------
@@ -475,7 +475,8 @@ def campaign_autopilot(cid):
         return "Campaign not found", 404
     if not config.ai_enabled():
         return render_template("message.html", title="AI writing is off",
-                               message="Add OPENAI_API_KEY in Vercel (Settings > Environment "
+                               message="Add GEMINI_API_KEY (free from Google AI Studio) or "
+                                       "OPENAI_API_KEY in Vercel (Settings > Environment "
                                        "Variables) and redeploy to turn on AI writing.",
                                back=url_for("campaign", cid=cid), user=current_user())
     if not camp.get("autopilot"):

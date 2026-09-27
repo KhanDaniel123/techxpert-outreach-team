@@ -3,7 +3,7 @@
 Run: `python3 tests/test_all.py` (from the project root)
 Date: 2026-09-28. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**176 passed, 0 failed.**
+**189 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -97,6 +97,17 @@ mode resets to fixed); campaign page shows the toggle, per-lead cost, and
 runs chunked (init, one lead, done); without a key the toggle is forced off,
 the campaign page explains AI is off, the autopilot route refuses, and
 normal templates still send. Avg cost per lead computed from stored tokens.
+
+## AI provider selection: Gemini or OpenAI (13)
+No key: provider is None and AI is off. Only OPENAI_API_KEY: provider is
+openai and the OpenAI cost math is unchanged. Only GEMINI_API_KEY: provider
+is gemini, cost is reported as 0.0 (free tier, nothing fabricated), and the
+model name is the Gemini model. Both keys: Gemini is preferred. Call info
+points at the Gemini OpenAI-compatible endpoint with the Gemini key and
+model. A mocked request confirms the POST goes to
+generativelanguage.googleapis.com/v1beta/openai/, uses the Gemini bearer key
+and model, and the JSON response parses. Default model is gemini-2.0-flash,
+overridable with GEMINI_MODEL.
 
 ## Full Autopilot pipeline (29)
 Migration: `pipeline_enabled`, `pipeline_target_leads`, `pipeline_stage`,

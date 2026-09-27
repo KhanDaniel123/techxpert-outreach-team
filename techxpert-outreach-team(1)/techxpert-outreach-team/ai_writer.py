@@ -1,13 +1,15 @@
 """Autopilot AI writer: generates one personalized cold email + 3 follow-ups
 per lead, grounded ONLY in observed website findings.
 
-No new dependencies: talks to the OpenAI chat-completions endpoint with
-urllib. All calls use config.AI_MODEL (a cheap model). Every generation is
+No new dependencies: talks to an OpenAI-style chat-completions endpoint with
+urllib. The backend is chosen by config.ai_provider(): Google's Gemini
+(GEMINI_API_KEY, free from AI Studio, preferred when set) or OpenAI
+(OPENAI_API_KEY). Both speak the same request format. Every generation is
 stored in the `ai_content` table once and cached, so a lead is never
 generated twice and costs stay predictable.
 
-If OPENAI_API_KEY is missing, nothing here runs: the autopilot toggle is
-hidden in the UI and campaigns fall back to normal templates.
+If no API key is set, nothing here runs: the autopilot toggle is hidden
+in the UI and campaigns fall back to normal templates.
 """
 import json
 import time
@@ -19,6 +21,7 @@ import db
 import gap_analysis
 
 OPENAI_URL = "https://api.openai.com/v1/chat/completions"
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 TIMEOUT_S = 60
 MAX_BODY_WORDS = 120
 MAX_FU_WORDS = 60
@@ -71,21 +74,32 @@ Each follow-up is under 60 words. Reply with JSON only:
                {"subject": "...", "body": "..."}]}"""
 
 
+def _provider_call_info():
+    """(url, api_key, model) for the configured AI backend."""
+    provider = config.ai_provider()
+    if provider == "gemini":
+        return GEMINI_URL, config.GEMINI_API_KEY, config.GEMINI_MODEL
+    return OPENAI_URL, config.OPENAI_API_KEY, config.AI_MODEL
+
+
 def _call_openai(messages):
-    """POST to chat-completions. Returns (parsed_json, usage_dict).
+    """POST to the chat-completions endpoint of the configured backend
+    (Gemini's OpenAI-compatible endpoint or OpenAI itself).
+    Returns (parsed_json, usage_dict).
     Raises RuntimeError on any failure (network, auth, bad JSON)."""
     if not config.ai_enabled():
         raise RuntimeError("AI writing is not turned on (no API key).")
+    url, api_key, model = _provider_call_info()
     payload = json.dumps({
-        "model": config.AI_MODEL,
+        "model": model,
         "messages": messages,
         "temperature": 0.7,
         "response_format": {"type": "json_object"},
     }).encode()
     req = urllib.request.Request(
-        OPENAI_URL, data=payload,
+        url, data=payload,
         headers={"Content-Type": "application/json",
-                 "Authorization": f"Bearer {config.OPENAI_API_KEY}"})
+                 "Authorization": f"Bearer {api_key}"})
     try:
         with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
             data = json.loads(resp.read().decode())
@@ -177,7 +191,12 @@ def get_ai_content(lead_id):
 
 
 def estimate_cost_usd(tokens_in, tokens_out):
-    """Approx USD cost for a token count, using config's price constants."""
+    """Approx USD cost for a token count, using config's price constants.
+
+    Gemini's free tier covers this app's volume, so cost is reported as
+    zero on the Gemini backend rather than a fabricated number."""
+    if config.ai_provider() == "gemini":
+        return 0.0
     return ((tokens_in or 0) / 1_000_000) * config.AI_PRICE_IN_PER_M + \
            ((tokens_out or 0) / 1_000_000) * config.AI_PRICE_OUT_PER_M
 

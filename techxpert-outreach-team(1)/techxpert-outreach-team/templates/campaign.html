@@ -86,7 +86,7 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <hr style="margin:18px 0;border-color:#1b2a4a">
 <h2>Autopilot: AI writes each email</h2>
 {% if not ai_on %}
-<p class="notice">AI writing is off. To turn it on, add <span class="mono">OPENAI_API_KEY</span> in Vercel under Settings &gt; Environment Variables, then redeploy. Your normal templates below keep working as usual.</p>
+<p class="notice">AI writing is off. To turn it on, add a <span class="mono">GEMINI_API_KEY</span> (free from Google AI Studio) or an <span class="mono">OPENAI_API_KEY</span> in Vercel under Settings &gt; Environment Variables, then redeploy. Your normal templates below keep working as usual.</p>
 {% else %}
 <p><label><input type="checkbox" name="autopilot" {{ 'checked' if campaign.autopilot }} style="width:auto"> Let AI write a personal email for each lead</label></p>
 <p><small class="mut">When on, the app visits each lead's website, notes one thing it can actually see (no booking page, no phone number, no reviews...), and writes a short personal email about that observation. It only ever mentions things it really saw, never guesses or invents numbers. Each email costs a fraction of a cent. Leads it can't write for automatically fall back to your template below.</small></p>

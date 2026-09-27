@@ -1224,6 +1224,82 @@ g = subprocess.run(["grep", "-rn", "--exclude-dir=tests",
                    capture_output=True, text=True).stdout.strip()
 check("no Google OAuth references", g == "", g[:200])
 
+# ================= 11. AI provider selection (Gemini vs OpenAI) =================
+_old_openai = configmod.OPENAI_API_KEY
+_old_gemini = configmod.GEMINI_API_KEY
+try:
+    configmod.OPENAI_API_KEY = ""
+    configmod.GEMINI_API_KEY = ""
+    check("provider: none when no keys",
+          configmod.ai_provider() is None and not configmod.ai_enabled())
+
+    configmod.OPENAI_API_KEY = "sk-test"
+    check("provider: openai when only OpenAI key",
+          configmod.ai_provider() == "openai" and configmod.ai_enabled())
+    check("cost math unchanged on openai",
+          abs(ai_writer.estimate_cost_usd(1_000_000, 1_000_000) - 0.75) < 1e-9)
+    check("model name is openai model on openai",
+          configmod.ai_model_name() == configmod.AI_MODEL)
+
+    configmod.OPENAI_API_KEY = ""
+    configmod.GEMINI_API_KEY = "g-test"
+    check("provider: gemini when only Gemini key",
+          configmod.ai_provider() == "gemini" and configmod.ai_enabled())
+    check("gemini cost reported as zero, not fabricated",
+          ai_writer.estimate_cost_usd(1_000_000, 1_000_000) == 0.0)
+    check("model name is gemini model on gemini",
+          configmod.ai_model_name() == configmod.GEMINI_MODEL)
+
+    configmod.OPENAI_API_KEY = "sk-test"
+    check("provider: gemini preferred when both keys set",
+          configmod.ai_provider() == "gemini")
+
+    info = ai_writer._provider_call_info()
+    check("call info points at Gemini endpoint with Gemini key/model",
+          info[0] == ai_writer.GEMINI_URL and info[1] == "g-test"
+          and info[2] == configmod.GEMINI_MODEL)
+
+    # _call_openai actually posts to the Gemini endpoint when gemini is set
+    seen = {}
+
+    class _FakeResp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            import json as _j
+            return _j.dumps({"choices": [{"message": {"content":
+                _j.dumps({"subject": "S", "body": "B"})}}],
+                             "usage": {"prompt_tokens": 10,
+                                       "completion_tokens": 5}}).encode()
+
+    def _fake_urlopen(req, timeout=None):
+        seen["url"] = req.full_url
+        seen["auth"] = req.get_header("Authorization")
+        import json as _j
+        seen["model"] = _j.loads(req.data.decode())["model"]
+        return _FakeResp()
+
+    with mock.patch("urllib.request.urlopen", side_effect=_fake_urlopen):
+        parsed, usage = ai_writer._call_openai(
+            [{"role": "user", "content": "hi"}])
+    check("gemini request goes to generativelanguage endpoint",
+          seen.get("url", "").startswith(
+              "https://generativelanguage.googleapis.com/v1beta/openai/"))
+    check("gemini request uses gemini key and model",
+          seen.get("auth") == "Bearer g-test"
+          and seen.get("model") == configmod.GEMINI_MODEL)
+    check("gemini response parsed", parsed.get("subject") == "S")
+finally:
+    configmod.OPENAI_API_KEY = _old_openai
+    configmod.GEMINI_API_KEY = _old_gemini
+
+check("gemini model default is flash, env-overridable",
+      configmod.GEMINI_MODEL == "gemini-2.0-flash")
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:
     print("FAILED:", failed)

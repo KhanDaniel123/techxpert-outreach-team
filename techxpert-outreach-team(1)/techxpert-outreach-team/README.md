@@ -136,8 +136,10 @@ each lead's website, notes one thing it can actually observe, writes a short
 personal email about that observation, and keeps following up until the lead
 replies.
 
-**Turning it on.** Add `OPENAI_API_KEY` in Vercel under Settings >
-Environment Variables and redeploy. Without the key, the Autopilot toggle is
+**Turning it on.** Add `GEMINI_API_KEY` (free from Google AI Studio) or
+`OPENAI_API_KEY` in Vercel under Settings >
+Environment Variables and redeploy. If both are set, Gemini is used. Without
+a key, the Autopilot toggle is
 hidden and everything works exactly as before. The key is never displayed
 anywhere in the app; Settings just shows "AI writing: Enabled/Disabled".
 
