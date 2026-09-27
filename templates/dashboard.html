@@ -12,7 +12,7 @@
 
 <div class="row">
 <div class="card"><h2>Queue processor</h2>
-<p><small>Sending and background jobs run when the scheduler hits <span class="mono">/api/process-queue</span>. For testing, trigger one tick manually:</small></p>
+<p><small>Sending and background jobs run when the scheduler hits <span class="mono">/api/process-queue</span>. For testing, trigger one tick manually. Note: one tick processes every teammate's due work, not just yours.</small></p>
 <form method="post" action="/api/process-now"><button class="ghost" type="submit">Process queue now (one tick)</button></form></div>
 <div class="card"><h2>Sender accounts</h2>
 {% for a in accounts %}<div style="margin:4px 0"><span class="mono">{{ a.email }}</span> <span class="pill {{ 'ok' if a.status=='active' else 'bad' }}">{{ a.status }}</span></div>{% else %}<p><small>None connected. <a href="/accounts">Connect your Gmail</a> to start sending.</small></p>{% endfor %}</div>
