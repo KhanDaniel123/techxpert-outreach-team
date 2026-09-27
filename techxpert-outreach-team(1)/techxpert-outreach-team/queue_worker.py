@@ -23,6 +23,7 @@ import db
 import sender
 import followups
 import jobs
+import pipeline
 
 MAX_SENDS_PER_CAMPAIGN = 5
 DRY_RUN_SENDS_PER_RUN = 25
@@ -225,10 +226,12 @@ def _scan_replies_all():
 
 
 def process_all(send_fn=None):
-    """One cron tick: reply scan + one job chunk + all due sends.
+    """One cron tick: reply scan + one job chunk + pipeline tick + all due sends.
     Returns a summary dict."""
     replies = _scan_replies_all()
     job_id = jobs.process_one_job_chunk()
+    pipe = pipeline.tick_all()
     sends = process_sends(send_fn=send_fn)
-    return {"job_chunk": job_id, "sends": sends, "replies_marked": replies,
+    return {"job_chunk": job_id, "pipeline": pipe, "sends": sends,
+            "replies_marked": replies,
             "processed_at": datetime.now().isoformat(timespec="seconds")}

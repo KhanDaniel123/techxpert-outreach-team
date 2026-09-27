@@ -23,6 +23,7 @@ import followups as followupsmod
 import queue_worker
 import jobs as jobsmod
 import ai_writer as aimod
+import pipeline as pipelinemod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -338,11 +339,16 @@ def campaign(cid):
     ai_on = config.ai_enabled()
     ai_cost, ai_written = (aimod.avg_cost_per_lead(cid) if camp.get("autopilot")
                            else (0.0, 0))
+    pipe_stats = pipelinemod.stats(cid)
+    pipe_stage = (camp.get("pipeline_stage") or "discover").strip() or "discover"
+    pipe_stage_label = pipelinemod.STAGE_LABELS.get(pipe_stage, pipe_stage)
     return render_template("campaign.html", campaign=camp, leads=lead_rows,
                            qstat={s["status"]: s["c"] for s in qstat}, job=job,
                            fu_list=fu_list, fu_map=fu_map, fu_count=fu_count,
                            fu_defaults=followupsmod.DEFAULT_FOLLOWUPS, seq=seq,
                            ai_on=ai_on, ai_cost=ai_cost, ai_written=ai_written,
+                           pipe=pipe_stats, pipe_stage=pipe_stage,
+                           pipe_stage_label=pipe_stage_label,
                            user=current_user())
 
 
@@ -478,6 +484,57 @@ def campaign_autopilot(cid):
                                        "first, then start AI writing.",
                                back=url_for("campaign", cid=cid), user=current_user())
     jobsmod.start_job(uid(), cid, "autopilot")
+    return redirect(url_for("campaign", cid=cid))
+
+
+@app.route("/campaign/<int:cid>/pipeline_save", methods=["POST"])
+def campaign_pipeline_save(cid):
+    r = require_login()
+    if r:
+        return r
+    if not _own_campaign(cid):
+        return "Campaign not found", 404
+    try:
+        target = int(request.form.get("pipeline_target_leads", 50) or 50)
+    except ValueError:
+        target = 50
+    target = max(5, min(500, target))
+    db.w("UPDATE campaigns SET niche=?, location=?, pipeline_target_leads=? "
+         "WHERE id=? AND user_id=?",
+         (request.form.get("niche", "").strip()[:120],
+          request.form.get("location", "").strip()[:120],
+          target, cid, uid()))
+    return redirect(url_for("campaign", cid=cid))
+
+
+@app.route("/campaign/<int:cid>/pipeline_start", methods=["POST"])
+def campaign_pipeline_start(cid):
+    r = require_login()
+    if r:
+        return r
+    camp = _own_campaign(cid)
+    if not camp:
+        return "Campaign not found", 404
+    if not (camp.get("niche") or "").strip() or not (camp.get("location") or "").strip():
+        return render_template("message.html", title="Niche and location needed",
+                               message="Type a niche and a location in the pipeline box "
+                                       "first, then start. The pipeline searches the web "
+                                       "for \"{niche} {location}\".",
+                               back=url_for("campaign", cid=cid), user=current_user())
+    db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
+         "pipeline_cursor='{}' WHERE id=? AND user_id=?", (cid, uid()))
+    return redirect(url_for("campaign", cid=cid))
+
+
+@app.route("/campaign/<int:cid>/pipeline_pause", methods=["POST"])
+def campaign_pipeline_pause(cid):
+    r = require_login()
+    if r:
+        return r
+    if not _own_campaign(cid):
+        return "Campaign not found", 404
+    db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=? AND user_id=?",
+         (cid, uid()))
     return redirect(url_for("campaign", cid=cid))
 
 

@@ -99,6 +99,13 @@ campaigns = Table("campaigns", metadata,
                   Column("status", Text, nullable=False, server_default=_sd("'draft'")),
                   Column("next_send_at", Float),  # nullable; worker treats None as 0
                   Column("last_account_id", Integer, default=0),
+                  # Full Autopilot pipeline: niche + location in, everything
+                  # else automatic. stage is one of discover/enrich/validate/
+                  # write/queue/done; cursor holds small JSON resume state.
+                  Column("pipeline_enabled", Integer, nullable=False, server_default="0"),
+                  Column("pipeline_target_leads", Integer, nullable=False, server_default="50"),
+                  Column("pipeline_stage", Text, default=""),
+                  Column("pipeline_cursor", Text, default=""),
                   Column("created_at", Float, nullable=False))
 
 leads = Table("leads", metadata,
@@ -228,7 +235,11 @@ def _migrate():
                       "followup_delay_hours INTEGER DEFAULT 40",
                       "autopilot INTEGER DEFAULT 0",
                       "followup_mode TEXT DEFAULT 'fixed'",
-                      "max_touches INTEGER DEFAULT 7"],
+                      "max_touches INTEGER DEFAULT 7",
+                      "pipeline_enabled INTEGER DEFAULT 0",
+                      "pipeline_target_leads INTEGER DEFAULT 50",
+                      "pipeline_stage TEXT DEFAULT ''",
+                      "pipeline_cursor TEXT DEFAULT ''"],
         "send_queue": ["step INTEGER DEFAULT 0"],
         "send_log": ["step INTEGER DEFAULT 0"],
         "leads": ["replied INTEGER DEFAULT 0",

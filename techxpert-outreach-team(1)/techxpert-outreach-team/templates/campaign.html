@@ -3,6 +3,39 @@
 {% if campaign.dry_run %}<span class="pill mut">DRY-RUN</span>{% else %}<span class="pill live">LIVE</span>{% endif %}</h1>
 <p><small>{{ campaign.niche }} | {{ campaign.location }} | delays {{ campaign.delay_min }}-{{ campaign.delay_max }}s | window {{ campaign.window_start }}-{{ campaign.window_end }} (server time, UTC on Vercel)</small></p>
 
+<div class="card pipe"><h2>Full Autopilot pipeline</h2>
+<p><small class="mut">Type a niche and location once, then Start. Every scheduler tick the app finds leads, extracts publicly listed emails, validates them, writes personal AI emails, and sends, all by itself. It stops for any lead that replies or bounces. Only publicly found, validated emails are ever mailed. Nothing is guessed.</small></p>
+<form method="post" action="/campaign/{{ campaign.id }}/pipeline_save"><div class="row">
+<div><label><small>Niche</small></label><input name="niche" value="{{ campaign.niche }}" placeholder="HVAC contractor"></div>
+<div><label><small>Location</small></label><input name="location" value="{{ campaign.location }}" placeholder="Phoenix AZ"></div>
+<div><label><small>Target leads</small></label><input type="number" name="pipeline_target_leads" min="5" max="500" value="{{ campaign.pipeline_target_leads or 50 }}"></div>
+<div style="flex:0;align-self:end"><button class="ghost" type="submit">Save</button></div></div></form>
+<p style="margin-top:10px"><small>
+Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_stage_label }}</span>
+<span class="pill mut">found: {{ pipe.found }}</span>
+<span class="pill mut">emails: {{ pipe.emails }}</span>
+<span class="pill mut">validated: {{ pipe.validated }}</span>
+<span class="pill mut">queued: {{ pipe.queued }}</span>
+<span class="pill mut">sent: {{ pipe.sent }}</span>
+<span class="pill ok">replies: {{ pipe.replies }}</span>
+</small></p>
+{% set _order = {'discover':0,'enrich':1,'validate':2,'write':3,'queue':4,'done':5} %}
+{% set _cur = _order.get(pipe_stage, 0) %}
+<div class="pipe-steps" aria-hidden="true">
+{% for _key,_label in [('discover','Finding leads'),('enrich','Finding emails'),('validate','Validating emails'),('write','Writing AI emails'),('queue','Queueing sends'),('done','Done')] %}
+<span class="pipe-step{{ ' now' if _key==pipe_stage else (' done' if _order[_key]<_cur else '') }}">{{ _label }}</span>
+{% endfor %}
+</div>
+<div class="actions">
+{% if campaign.pipeline_enabled %}
+<form method="post" action="/campaign/{{ campaign.id }}/pipeline_pause"><button class="warn" type="submit">Pause pipeline</button></form>
+{% else %}
+<form method="post" action="/campaign/{{ campaign.id }}/pipeline_start"><button type="submit">Start pipeline</button></form>
+{% endif %}
+</div>
+<p><small class="mut">Runs a little on every scheduler tick (about every 15 minutes): a few new leads per tick, a few emails extracted, a few validated, one AI email written, then sending through the normal queue with all the usual reply/bounce guards.{% if not ai_on %} AI writing is off (no API key), so the pipeline uses your normal template below instead.{% endif %}</small></p>
+</div>
+
 <div class="card"><h2>Leads ({{ leads|length }})</h2>
 <div class="actions">
 <form method="post" action="/campaign/{{ campaign.id }}/import" enctype="multipart/form-data">

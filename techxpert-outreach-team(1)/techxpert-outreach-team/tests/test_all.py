@@ -993,6 +993,229 @@ check("no key: normal template still sends",
       len(sent9d) == 1 and sent9d[0][1] == "Sx")
 configmod.OPENAI_API_KEY = ""
 
+# ================= 10. Full Autopilot pipeline =================
+import pipeline as pipelinemod
+
+colnames = [r["name"] for r in db.q("PRAGMA table_info(campaigns)")]
+for cname in ("pipeline_enabled", "pipeline_target_leads",
+              "pipeline_stage", "pipeline_cursor"):
+    check(f"migration: campaigns.{cname} exists", cname in colnames)
+db.init_db(); db.init_db()
+colnames2 = [r["name"] for r in db.q("PRAGMA table_info(campaigns)")]
+check("migration idempotent (run twice)", colnames == colnames2)
+
+# --- routes: save / start / pause ---
+campP = make_campaign(ca, "Pipe1", dry_run=1)
+campP0 = make_campaign(ca, "Pipe0", dry_run=1)
+db.w("UPDATE campaigns SET niche='', location='' WHERE id=?", (campP0,))
+r = ca.post(f"/campaign/{campP0}/pipeline_start", follow_redirects=False)
+check("pipeline start needs niche+location",
+      r.status_code == 200 and "Niche and location needed" in r.data.decode())
+r = ca.post(f"/campaign/{campP}/pipeline_save",
+            data={"niche": "HVAC contractor", "location": "Phoenix AZ",
+                  "pipeline_target_leads": "12"}, follow_redirects=False)
+camp = db.q("SELECT niche, location, pipeline_target_leads "
+            "FROM campaigns WHERE id=?", (campP,), one=True)
+check("pipeline save stores niche/location/target",
+      r.status_code == 302 and camp["niche"] == "HVAC contractor"
+      and camp["location"] == "Phoenix AZ" and camp["pipeline_target_leads"] == 12)
+ca.post(f"/campaign/{campP}/pipeline_save",
+        data={"niche": "x", "location": "y", "pipeline_target_leads": "9999"},
+        follow_redirects=False)
+camp = db.q("SELECT pipeline_target_leads FROM campaigns WHERE id=?", (campP,), one=True)
+check("pipeline target clamped to 500", camp["pipeline_target_leads"] == 500)
+r = ca.post(f"/campaign/{campP}/pipeline_start", follow_redirects=False)
+camp = db.q("SELECT pipeline_enabled, pipeline_stage FROM campaigns WHERE id=?",
+            (campP,), one=True)
+check("pipeline start enables + resets to discover",
+      r.status_code == 302 and camp["pipeline_enabled"] == 1
+      and camp["pipeline_stage"] == "discover")
+r = ca.post(f"/campaign/{campP}/pipeline_pause", follow_redirects=False)
+camp = db.q("SELECT pipeline_enabled FROM campaigns WHERE id=?", (campP,), one=True)
+check("pipeline pause disables", r.status_code == 302 and camp["pipeline_enabled"] == 0)
+r = ca.get(f"/campaign/{campP}")
+htmlP = r.data.decode()
+check("campaign page shows pipeline box + stats",
+      "Full Autopilot pipeline" in htmlP and "Start pipeline" in htmlP
+      and "Stage:" in htmlP)
+
+# --- discover stage (mocked web search) ---
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
+     "pipeline_target_leads=4, pipeline_cursor='{}', niche='HVAC contractor', "
+     "location='Phoenix AZ' WHERE id=?", (campP,))
+fake_links = ["https://acmeair.example/page", "https://bestcool.example/",
+              "https://acmeair.example/other"]
+
+
+def fake_identity(url):
+    from urllib.parse import urlparse
+    dom = urlparse(url).netloc
+    return {"name": dom.split(".")[0].title() + " Co", "phone": "", "address": ""}
+
+
+with mock.patch("scrapers.websearch.ddg_links", return_value=list(fake_links)), \
+     mock.patch("scrapers.websearch._site_identity", side_effect=fake_identity):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, note = pipelinemod.tick_campaign(camp)
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage2, note2 = pipelinemod.tick_campaign(camp)  # variants exhaust -> enrich
+check("discover tick inserts deduped leads",
+      stage == "discover"
+      and db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+               (campP,), one=True)["c"] == 2)
+check("discover dedupes across ticks, then advances to enrich",
+      stage2 == "enrich" and "advanced" in note2)
+db.w("UPDATE campaigns SET pipeline_stage='discover' WHERE id=?", (campP,))
+with mock.patch("scrapers.websearch.ddg_links", return_value=list(fake_links)), \
+     mock.patch("scrapers.websearch._site_identity", side_effect=fake_identity):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage3, _ = pipelinemod.tick_campaign(camp)
+check("discover never inserts duplicates",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+           (campP,), one=True)["c"] == 2)
+
+# --- enrich stage (mocked) ---
+db.w("UPDATE campaigns SET pipeline_stage='enrich' WHERE id=?", (campP,))
+
+
+def fake_enrich(rows, pause=0.8):
+    out = []
+    for i, r in enumerate(rows):
+        if i == 0:
+            out.append({"lead_id": r["id"], "email": "info@acmeair.example",
+                        "phone": "555-1234", "has_contact_form": False,
+                        "pages_checked": 2})
+        else:
+            out.append({"lead_id": r["id"], "email": "", "phone": "",
+                        "has_contact_form": True, "pages_checked": 2})
+    return out
+
+
+with mock.patch("enrich.enrich_leads", side_effect=fake_enrich):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, _ = pipelinemod.tick_campaign(camp)
+got = db.q("SELECT id, email, email_verdict FROM leads WHERE campaign_id=? AND email<>''",
+           (campP,))
+none = db.q("SELECT id, email_verdict FROM leads WHERE campaign_id=? AND email=''",
+            (campP,))
+check("enrich: found email stored, verdict pending",
+      stage == "enrich" and len(got) == 1 and got[0]["email_verdict"] == ""
+      and got[0]["email"] == "info@acmeair.example")
+check("enrich: no-email lead marked none", len(none) == 1 and none[0]["email_verdict"] == "none")
+with mock.patch("enrich.enrich_leads",
+                side_effect=AssertionError("no-email lead must not be retried")):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, note = pipelinemod.tick_campaign(camp)
+check("enrich completes without retrying none leads",
+      stage == "validate" and "advanced" in note)
+
+# --- validate stage (mocked) ---
+lid_good = got[0]["id"]
+lid_bad = add_lead(campP, ua["id"], "bad@invalid.example", "Bad Biz")
+
+
+def fake_validate(emails, max_workers=5):
+    return [{"email": e, "verdict": "invalid" if e.startswith("bad@") else "valid",
+             "reason": "mocked", "mx_host": "", "catch_all": False,
+             "duration": 0.1} for e in emails]
+
+
+with mock.patch("email_validator.validate_emails", side_effect=fake_validate):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, _ = pipelinemod.tick_campaign(camp)
+good = db.q("SELECT email, email_verdict FROM leads WHERE id=?", (lid_good,), one=True)
+bad = db.q("SELECT email, email_verdict FROM leads WHERE id=?", (lid_bad,), one=True)
+check("validate: good email kept as valid",
+      stage == "validate" and good["email_verdict"] == "valid" and good["email"] != "")
+check("validate: invalid email dropped (cleared, never sendable)",
+      bad["email"] == "" and bad["email_verdict"] == "invalid")
+with mock.patch("email_validator.validate_emails",
+                side_effect=AssertionError("nothing left to validate")):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, note = pipelinemod.tick_campaign(camp)
+check("validate completes, advances to write",
+      stage == "write" and "advanced" in note)
+
+# --- write stage ---
+configmod.OPENAI_API_KEY = ""
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+stage, note = pipelinemod.tick_campaign(camp)
+check("write skipped without API key, advances to queue",
+      stage == "queue" and "advanced" in note)
+configmod.OPENAI_API_KEY = "sk-test-..."
+
+
+def fake_gen(lead, camp):
+    db.w("UPDATE leads SET ai_status='ready' WHERE id=?", (lead["id"],))
+    return ("ready", "")
+
+
+db.w("UPDATE campaigns SET pipeline_stage='write' WHERE id=?", (campP,))
+with mock.patch("ai_writer.generate_and_store", side_effect=fake_gen):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, _ = pipelinemod.tick_campaign(camp)
+ai_leads = db.q("SELECT id FROM leads WHERE campaign_id=? AND ai_status='ready'",
+                (campP,))
+check("write: AI runs only for validated lead",
+      stage == "write" and [l["id"] for l in ai_leads] == [lid_good])
+with mock.patch("ai_writer.generate_and_store",
+                side_effect=AssertionError("nothing left to write")):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, note = pipelinemod.tick_campaign(camp)
+check("write completes, advances to queue",
+      stage == "queue" and "advanced" in note)
+
+# --- queue stage: strict guards ---
+lid_unk = add_lead(campP, ua["id"], "mystery@example.com", "Mystery")
+db.w("UPDATE leads SET email_verdict='unknown' WHERE id=?", (lid_unk,))
+lid_rep = add_lead(campP, ua["id"], "reply@example.com", "Replier")
+db.w("UPDATE leads SET email_verdict='valid', replied=1 WHERE id=?", (lid_rep,))
+lid_bnc = add_lead(campP, ua["id"], "bounce@example.com", "Bouncer")
+db.w("UPDATE leads SET email_verdict='valid' WHERE id=?", (lid_bnc,))
+db.w("INSERT INTO send_log (user_id, campaign_id, lead_id, recipient, sent_at, status)"
+     " VALUES (?,?,?,?,?,'bounced')",
+     (ua["id"], campP, lid_bnc, "bounce@example.com", time.time()))
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+stage, _ = pipelinemod.tick_campaign(camp)
+queued = [q["lead_id"] for q in
+          db.q("SELECT lead_id FROM send_queue WHERE campaign_id=?", (campP,))]
+check("queue: only valid, uncontacted lead queued",
+      stage == "queue" and queued == [lid_good])
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+stage, note = pipelinemod.tick_campaign(camp)
+check("queue idempotent (no dupes), completes to done",
+      stage == "done" and "advanced" in note
+      and db.q("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=?",
+               (campP,), one=True)["c"] == 1)
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+stage, note = pipelinemod.tick_campaign(camp)
+check("done stage is terminal (never restarts)", stage == "done" and note == "")
+
+# --- tick_all: paused campaigns skipped ---
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+s = pipelinemod.tick_all()
+check("tick_all skips paused campaigns",
+      all(c["id"] != campP for c in s["campaigns"]) and "elapsed_s" in s)
+db.w("UPDATE campaigns SET pipeline_enabled=1 WHERE id=?", (campP,))
+s = pipelinemod.tick_all()
+mine = [c for c in s["campaigns"] if c["id"] == campP]
+check("tick_all advances one stage per enabled campaign per call",
+      len(mine) == 1 and mine[0]["stage"] == "done")
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+
+# --- process_all integration: pipeline tick runs inside the scheduler ---
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='done' WHERE id=?",
+     (campP,))
+with mock.patch.object(queue_worker, "_scan_replies_all", return_value=0), \
+     mock.patch.object(queue_worker, "process_sends", return_value={"processed": 0}), \
+     mock.patch.object(jobsmod, "process_one_job_chunk", return_value=None), \
+     mock.patch.object(pipelinemod, "tick_campaign",
+                       side_effect=pipelinemod.tick_campaign) as spy_tick:
+    res = queue_worker.process_all()
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+check("process_all includes pipeline tick",
+      "pipeline" in res and "campaigns" in res["pipeline"] and spy_tick.called)
+
 # no residual Google OAuth references
 import subprocess
 g = subprocess.run(["grep", "-rn", "--exclude-dir=tests",

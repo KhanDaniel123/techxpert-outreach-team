@@ -18,7 +18,7 @@
 {% for a in accounts %}<div style="margin:4px 0"><span class="mono">{{ a.email }}</span> <span class="pill {{ 'ok' if a.status=='active' else 'bad' }}">{{ a.status }}</span></div>{% else %}<p><small>None connected. <a href="/accounts">Connect your Gmail</a> to start sending.</small></p>{% endfor %}</div>
 </div>
 
-<div class="card"><h2>&#128293; Replied leads <small>{{ replied_leads|length }} waiting for your move</small></h2>
+<div class="card"><h2><span class="dot"></span>Replied leads <small>{{ replied_leads|length }} waiting for your move</small></h2>
 {% if replied_leads %}<div class="twrap"><table>
 <tr><th>Business</th><th>Email</th><th>Campaign</th><th>Reply</th><th>When</th><th></th></tr>
 {% for r in replied_leads %}<tr>

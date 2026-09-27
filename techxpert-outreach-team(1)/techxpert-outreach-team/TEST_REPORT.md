@@ -1,9 +1,9 @@
 # Test report - TechXpert Outreach v2 (Google-free)
 
-Run: `~/workspace/v2test-venv/bin/python tests/test_all.py`
-Date: 2026-09-27. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
+Run: `python3 tests/test_all.py` (from the project root)
+Date: 2026-09-28. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-**147 passed, 0 failed.**
+**176 passed, 0 failed.**
 
 ## Auth (10)
 Register success, duplicate email rejected, bad email rejected, short password
@@ -97,3 +97,24 @@ mode resets to fixed); campaign page shows the toggle, per-lead cost, and
 runs chunked (init, one lead, done); without a key the toggle is forced off,
 the campaign page explains AI is off, the autopilot route refuses, and
 normal templates still send. Avg cost per lead computed from stored tokens.
+
+## Full Autopilot pipeline (29)
+Migration: `pipeline_enabled`, `pipeline_target_leads`, `pipeline_stage`,
+`pipeline_cursor` exist on campaigns and `init_db()` is idempotent. Routes:
+start refuses without niche+location (explains itself); save stores
+niche/location/target (clamped 5-500); start enables and resets to discover;
+pause disables; campaign page shows the pipeline box with live stats.
+Discover: one tick inserts deduped leads from mocked web search, never
+duplicates across ticks, advances to enrich when variants exhaust. Enrich:
+public email stored with pending verdict; no-email leads marked `none` and
+never retried; completion advances to validate. Validate: good emails kept
+as valid; invalid emails are dropped (address cleared so they can never
+send); completion advances to write. Write: skipped without an API key
+(normal templates used instead); with a key, AI runs only for validated
+leads; completion advances to queue. Queue: only valid/risky, selected,
+never-contacted leads are queued; unknown/invalid/no-email leads, replied
+leads, and bounced leads are excluded; queueing is idempotent and completes
+to a terminal done stage that never restarts. tick_all skips paused
+campaigns and advances one stage per enabled campaign per tick.
+`process_all` runs the pipeline tick inside the scheduler alongside the
+reply scan, job chunk, and sends.
