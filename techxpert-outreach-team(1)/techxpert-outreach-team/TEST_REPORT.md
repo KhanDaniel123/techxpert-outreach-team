@@ -1,75 +1,61 @@
-# TEST_REPORT
+# Test report - TechXpert Outreach v2 (Google-free)
 
-Date: 2026-09-27. App: TechXpert Outreach (team / hosted), repo
-`~/workspace/techxpert-outreach-team`. Suite: `tests/test_smoke.py`.
+Run: `/tmp/v2venv/bin/python tests/test_all.py`
+Date: 2026-09-27. DB: throwaway SQLite. Network: mocked (no real Gmail/IMAP calls).
 
-## Tested locally (SQLite, mocked external services): 53/53 PASS
+**83 passed, 0 failed.**
 
-- Mocked Google identity: user creation, repeat login keeps same id and
-  refreshes name/email, two users are distinct.
-- Token encryption round trip (Fernet): ciphertext stored, plaintext not
-  present, decrypt returns original.
-- Campaign creation via HTTP route, campaign scoped to the signed-in user.
-- CSV sample import: 12 leads; manual lead add.
-- Spintax: ~even distribution over 300 draws; template variables render,
-  unknown variables left intact.
-- Two Gmail accounts stored with encrypted tokens; warmup math (day 0 -> 5/day,
-  day 10 -> ~16/day, day 30 -> full cap, warmup off -> full cap).
-- Rotation: 12 dry-run sends alternate strictly A,B,A,B (found and fixed a
-  real bug: the in-memory campaign dict went stale between back-to-back sends).
-- Caps: at-cap account excluded from rotation.
-- Enqueue + `process_sends` (dry-run): 13 leads queued, all processed in one
-  tick, queue marked sent, campaign marked done.
-- Sending windows: campaign outside its window defers with
-  `waiting_for_window`, `next_send_at` pushed into the next window.
-- Cron endpoint: 401 without secret, 401 with wrong secret, 200 with
-  `X-Cron-Secret` (GET) and `Authorization: Bearer` (POST); response includes
-  job_chunk/sends/processed_at.
-- `/api/process-now`: redirects when logged out, 200 when logged in.
-- Data isolation: user 2 gets 404 on user 1's campaign and sees an empty log.
-- Bounce handling: 3/20 forced bounces marked, 15% rate auto-pauses account,
-  account row set to paused.
-- Email validator fast paths: bad syntax -> invalid, disposable domain ->
-  invalid, no-MX domain -> invalid, blocked SMTP port 25 -> `unknown`
-  (degrades, never crashes).
-- Chunked serverless jobs with mocked network: web search (4 links -> 4 leads,
-  completes over ticks), enrichment (emails stored, auto-validated), validation
-  (completes).
-- Template save + preview render via HTTP.
-- Accounts page HTML contains no token ciphertext or `token_enc`.
-- Account pause/resume/cap update via routes; job status endpoint 200 for owner.
-- Boot test: `python app.py` serves the login page (200), `/dashboard`
-  redirects to login when signed out, `/api/process-queue` returns 401
-  without a secret.
+## Auth (10)
+Register success, duplicate email rejected, bad email rejected, short password
+rejected, password stored as scrypt hash (never plaintext), login success,
+wrong password rejected, unknown email rejected, logout + protected redirect,
+accounts page requires login.
 
-Also verified: all pinned `requirements.txt` versions install cleanly
-(Flask 3.1.0, SQLAlchemy 2.0.36, psycopg2-binary, google API clients,
-cryptography, dnspython, bs4, requests).
+## Sender accounts (6)
+Add route works with mocked credential verify; App Password stored
+Fernet-encrypted and decrypts to the cleaned 16 chars; accounts page never
+renders the secret; short App Password rejected (400); failed verification
+rejected (400).
 
-Live-network spot check (not part of the suite): `enrich_leads` fetched
-dayandnightair.com and extracted `info@dayandnightair.com` + a phone number;
-parkerandsons.com blocked the fetch (bot protection); example.com has no
-contact email. Matches the ~33% real-world hit rate seen in the local app.
+## SMTP sending (7)
+Live send through mocked `smtplib.SMTP`: STARTTLS used, login with the
+decrypted App Password, correct From/To/Subject/body; send_log status=sent,
+step=0; daily counter incremented; `verify_credentials` reports auth failure
+and success correctly.
 
-## NOT tested live (requires real credentials / deployment)
+## Follow-up configuration (13)
+Campaign creation seeds 5 default follow-ups; campaign row defaults
+(enabled=1, count=5, 40h); count=3 keeps exactly 3 steps; interval saved;
+count clamps to 1..10; old-style template saves don't wipe follow-ups; blank
+body deletes a step; form shows exactly N fields (steps beyond N hidden);
+enable checkbox and 1-10 count input present.
 
-- Vercel deployment and `api/index.py` serverless handler.
-- Real Neon Postgres (`DATABASE_URL` Postgres path). The SQL is dialect-neutral
-  (`?` -> named binds, `RETURNING id` on Postgres, `lastrowid` on SQLite), but
-  it has not run against a real Postgres server.
-- Real Google OAuth handshake (login + Gmail connect) and real Gmail sends.
-- Real external cron delivery (cron-job.org / GitHub Actions schedule).
-- Vercel's automatic `Authorization: Bearer $CRON_SECRET` cron header
-  (code accepts it; not observed live).
+## Follow-up chaining & gating (13)
+Step-0 send queues step-1 ~40h out; future follow-up not sent early
+(`waiting_for_followups`); step-1 sends when due with variables/spintax
+rendered from its own template; send_log records steps; reply stops the
+sequence (`sequence_stopped`, queue row failed); bounce stops it; missing
+previous step blocks it; disabled follow-ups don't chain; chain stops at the
+configured count; campaign page shows Replied / F1-queued per-lead status;
+logs page shows Initial/F1 step pills.
 
-## Bugs found and fixed during testing
+## Reply & bounce detection (4)
+`scan_replies` (mocked IMAP) returns the replier's address, skips
+mailer-daemon and the account's own address; `mark_replies` is
+case-insensitive and user-scoped; `scan_bounces` extracts the failed
+recipient; IMAP failures degrade to `[]` (never raise).
 
-1. SQLAlchemy 2.x rejects positional `?` tuples in `text()`: rewrote `?` to
-   named binds (`:p0`...) and converted tuples to dicts; INSERT id retrieval
-   now uses Postgres `RETURNING id` with SQLite `lastrowid` fallback.
-2. NOT NULL columns without server defaults broke raw-SQL INSERTs: added
-   `server_default` to all omittable flag columns; `next_send_at` made
-   nullable (worker treats None as 0).
-3. Rotation bug: `pick_account` updated the DB but the caller's in-memory
-   campaign dict went stale, so back-to-back `send_one` calls reused one
-   account. Now syncs the dict too.
+## Preserved engine (20)
+Spintax (incl. nested), template variables, round-robin rotation, caps/paused
+exclusion, 21-day warmup ramp, enqueue, dry-run processing + logging, dry-run
+follow-up previews, campaign stays `sending` while follow-ups pending,
+sending-window deferral, cron 401 without secret / 200 with secret (with
+`replies_marked` in the response), cross-user campaign 404, user-scoped logs,
+template save + preview, validator fast paths (bad syntax, disposable), mocked
+validate and enrich job chunks, no `gmail_oauth`/`GOOGLE_CLIENT_ID`/
+`GOOGLE_CLIENT_SECRET` references anywhere in app code.
+
+## Not covered by automated tests (do live after deploy)
+One supervised real Gmail send (App Password login from Vercel's network),
+one live IMAP reply/bounce scan, and the external 10-minute cron actually
+triggering `/api/process-queue`.

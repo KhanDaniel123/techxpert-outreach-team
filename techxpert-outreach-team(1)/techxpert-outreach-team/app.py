@@ -1,8 +1,10 @@
 """TechXpert Outreach - hosted team version (Vercel-ready Flask app).
 
-Each user signs in with Google; Gmail connections, campaigns and leads are
-scoped to their Google identity. No background threads: sending and chunked
-jobs run via POST /api/process-queue (cron).
+Each user registers with email + password; sender accounts, campaigns and
+leads are scoped to their login. No Google OAuth anywhere: login is built
+in (auth.py) and sending is direct Gmail SMTP with per-user App Passwords
+(smtp_mail.py). No background threads: sending and chunked jobs run via
+POST /api/process-queue (cron).
 """
 import io
 import os
@@ -16,9 +18,10 @@ import auth as authmod
 import crypto as cryptomod
 import leads as leadmod
 import sender as sendermod
+import smtp_mail
+import followups as followupsmod
 import queue_worker
 import jobs as jobsmod
-import gmail_oauth
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 app = Flask(__name__, template_folder=os.path.join(BASE_DIR, "templates"))
@@ -41,44 +44,37 @@ def require_login():
     return None
 
 
-# ---------------- auth ----------------
+# ---------------- auth (built-in email + password) ----------------
 
-@app.route("/login")
+@app.route("/login", methods=["GET", "POST"])
 def login():
     if uid():
         return redirect(url_for("dashboard"))
-    return render_template("login.html", user=None)
+    error = None
+    if request.method == "POST":
+        user = authmod.verify_login(request.form.get("email", ""),
+                                    request.form.get("password", ""))
+        if user:
+            session["user_id"] = user["id"]
+            return redirect(url_for("dashboard"))
+        error = "Wrong email or password."
+    return render_template("login.html", user=None, error=error)
 
 
-@app.route("/login/start")
-def login_start():
+@app.route("/register", methods=["GET", "POST"])
+def register():
     if uid():
         return redirect(url_for("dashboard"))
-    try:
-        flow = authmod.make_login_flow()
-    except RuntimeError as e:
-        return render_template("message.html", title="Setup needed", message=str(e),
-                               back=None, user=None), 500
-    auth_url, state = flow.authorization_url(access_type="online",
-                                             include_granted_scopes="false")
-    session["login_state"] = state
-    return redirect(auth_url)
-
-
-@app.route("/login/callback")
-def login_callback():
-    try:
-        flow = authmod.make_login_flow(state=session.get("login_state"))
-        flow.fetch_token(authorization_response=request.url)
-        sub, email, name = authmod.fetch_userinfo(flow.credentials)
-    except Exception as e:
-        return render_template("message.html", title="Sign-in failed",
-                               message=f"Google sign-in failed: {str(e)[:200]}",
-                               back=url_for("login"), user=None), 400
-    user = db.get_or_create_user(sub, email, name)
-    session["user_id"] = user["id"]
-    session.pop("login_state", None)
-    return redirect(url_for("dashboard"))
+    error = None
+    if request.method == "POST":
+        ok, payload = authmod.register_user(request.form.get("email", ""),
+                                            request.form.get("name", ""),
+                                            request.form.get("password", ""))
+        if ok:
+            session["user_id"] = payload["id"]
+            return redirect(url_for("dashboard"))
+        error = payload
+    return render_template("register.html", user=None, error=error)
 
 
 @app.route("/logout")
@@ -98,7 +94,7 @@ def dashboard():
     if r:
         return r
     camps = db.q("SELECT * FROM campaigns WHERE user_id=? ORDER BY id DESC", (uid(),))
-    accts = db.q("SELECT * FROM gmail_accounts WHERE user_id=? ORDER BY id", (uid(),))
+    accts = db.q("SELECT * FROM sender_accounts WHERE user_id=? ORDER BY id", (uid(),))
     stats = db.q("SELECT status, COUNT(*) c FROM send_log WHERE user_id=? GROUP BY status",
                  (uid(),))
     missing = config.check_prod() if os.environ.get("VERCEL") else []
@@ -107,93 +103,78 @@ def dashboard():
                            missing=missing)
 
 
-# ---------------- Gmail accounts ----------------
+# ---------------- sender accounts (Gmail SMTP via App Password) ----------------
 
 @app.route("/accounts")
 def accounts():
     r = require_login()
     if r:
         return r
-    accts = db.q("SELECT * FROM gmail_accounts WHERE user_id=? ORDER BY id", (uid(),))
+    accts = db.q("SELECT * FROM sender_accounts WHERE user_id=? ORDER BY id", (uid(),))
     view = []
     for a in accts:
         a = dict(a)
-        a.pop("token_enc", None)  # never render tokens
+        a.pop("password_enc", None)  # never render secrets
         a["eff_cap"] = sendermod.effective_cap(a)
         a["age_days"] = round(sendermod.account_age_days(a), 1)
         view.append(a)
-    return render_template("accounts.html", accounts=view, oauth_ready=config.OAUTH_READY,
-                           user=current_user())
+    return render_template("accounts.html", accounts=view, user=current_user())
 
 
-@app.route("/oauth/start")
-def oauth_start():
+@app.route("/accounts/add", methods=["POST"])
+def accounts_add():
     r = require_login()
     if r:
         return r
-    try:
-        flow = gmail_oauth.make_flow()
-    except RuntimeError as e:
-        return render_template("message.html", title="OAuth not configured",
-                               message=str(e), back=url_for("accounts"),
-                               user=current_user()), 400
-    auth_url, state = flow.authorization_url(access_type="offline", prompt="consent",
-                                             include_granted_scopes="true")
-    session["oauth_state"] = state
-    return redirect(auth_url)
-
-
-@app.route("/oauth/callback")
-def oauth_callback():
-    r = require_login()
-    if r:
-        return r
-    try:
-        flow = gmail_oauth.make_flow(state=session.get("oauth_state"))
-        flow.fetch_token(authorization_response=request.url)
-        creds = flow.credentials
-        # Build a throwaway service to learn the account's email address.
-        # The token is encrypted before storage; nothing sensitive is logged.
-        import gmail_oauth as go
-        service = go.build_service(go.token_json_from_credentials(creds))
-        email = go.get_profile_email(service)
-        token_enc = cryptomod.encrypt_token(go.token_json_from_credentials(creds))
-    except Exception as e:
-        return render_template("message.html", title="Gmail connect failed",
-                               message=f"Could not complete Google authorization: {str(e)[:200]}",
+    email = (request.form.get("email", "") or "").strip().lower()
+    raw_pw = request.form.get("app_password", "") or ""
+    pw = smtp_mail.clean_app_password(raw_pw)
+    if "@" not in email or "." not in email.split("@")[-1]:
+        return render_template("message.html", title="Could not add account",
+                               message="Enter a valid Gmail address.",
                                back=url_for("accounts"), user=current_user()), 400
+    if not smtp_mail.valid_app_password(pw):
+        return render_template("message.html", title="Could not add account",
+                               message=("That does not look like a 16-character App Password. "
+                                        "Create one at myaccount.google.com > Security > App "
+                                        "passwords, then paste all 16 characters (spaces are fine)."),
+                               back=url_for("accounts"), user=current_user()), 400
+    ok, err = smtp_mail.verify_credentials(email, pw)
+    if not ok:
+        return render_template("message.html", title="Gmail login failed", message=err,
+                               back=url_for("accounts"), user=current_user()), 400
+    pw_enc = cryptomod.encrypt_token(pw)
     now = time.time()
-    existing = db.q("SELECT id FROM gmail_accounts WHERE user_id=? AND email=?",
+    existing = db.q("SELECT id FROM sender_accounts WHERE user_id=? AND email=?",
                     (uid(), email), one=True)
     if existing:
-        db.w("UPDATE gmail_accounts SET token_enc=?, status='active' WHERE id=?",
-             (token_enc, existing["id"]))
+        db.w("UPDATE sender_accounts SET password_enc=?, status='active' WHERE id=?",
+             (pw_enc, existing["id"]))
     else:
-        db.w("""INSERT INTO gmail_accounts
-                (user_id, email, token_enc, daily_cap, warmup_enabled,
+        db.w("""INSERT INTO sender_accounts
+                (user_id, email, password_enc, daily_cap, warmup_enabled,
                  warmup_start, status, sent_today, sent_date, created_at)
                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
-             (uid(), email, token_enc, 30, 1, now, "active", 0, "", now))
-    session.pop("oauth_state", None)
+             (uid(), email, pw_enc, 30, 1, now, "active", 0, "", now))
     return redirect(url_for("accounts"))
 
 
 def _own_account(aid):
-    return db.q("SELECT * FROM gmail_accounts WHERE id=? AND user_id=?",
+    return db.q("SELECT * FROM sender_accounts WHERE id=? AND user_id=?",
                 (aid, uid()), one=True)
 
 
 @app.route("/account/<int:aid>/pause", methods=["POST"])
 def account_pause(aid):
     if _own_account(aid):
-        db.w("UPDATE gmail_accounts SET status='paused' WHERE id=?", (aid,))
+        db.w("UPDATE sender_accounts SET status='paused' WHERE id=?", (aid,))
     return redirect(url_for("accounts"))
 
 
 @app.route("/account/<int:aid>/resume", methods=["POST"])
 def account_resume(aid):
     if _own_account(aid):
-        db.w("UPDATE gmail_accounts SET status='active' WHERE id=?", (aid,))
+        db.w("UPDATE sender_accounts SET status='active' WHERE id=?", (aid,))
     return redirect(url_for("accounts"))
 
 
@@ -205,7 +186,7 @@ def account_cap(aid):
         except ValueError:
             cap = 30
         warmup = 1 if request.form.get("warmup_enabled") else 0
-        db.w("UPDATE gmail_accounts SET daily_cap=?, warmup_enabled=? WHERE id=?",
+        db.w("UPDATE sender_accounts SET daily_cap=?, warmup_enabled=? WHERE id=?",
              (cap, warmup, aid))
     return redirect(url_for("accounts"))
 
@@ -216,14 +197,22 @@ def account_bounces(aid):
     if not acct:
         return redirect(url_for("accounts"))
     try:
-        service = gmail_oauth.get_service(acct)
-        res = sendermod.check_account_bounces(uid(), aid, service=service)
+        res = sendermod.check_account_bounces(uid(), aid)
+        # Reply detection rides the same inbox visit: any lead address seen in
+        # recent non-bounce mail is marked replied, stopping their sequence.
+        import smtp_mail as _sm
+        replied = 0
+        try:
+            replied = sendermod.mark_replies(uid(), _sm.scan_replies(acct))
+        except Exception:
+            pass
         msg = (f"Checked {res['looked_at']} recent sends: {res['bounced_marked']} "
-               f"bounces marked, rate {res['bounce_rate']*100:.1f}%."
+               f"bounces marked, rate {res['bounce_rate']*100:.1f}%; "
+               f"{replied} lead(s) marked as replied."
                + (" Account auto-paused." if res["paused"] else ""))
     except Exception as e:
-        msg = f"Bounce scan failed: {str(e)[:200]}"
-    return render_template("message.html", title="Bounce scan", message=msg,
+        msg = f"Inbox scan failed: {str(e)[:200]}"
+    return render_template("message.html", title="Inbox scan", message=msg,
                            back=url_for("accounts"), user=current_user())
 
 
@@ -250,6 +239,8 @@ def campaign_new():
              int(request.form.get("delay_max", 180) or 180),
              request.form.get("window_start", "09:00"), request.form.get("window_end", "17:00"),
              1 if request.form.get("dry_run") else 0, "draft", time.time()))
+        # Seed the 5 default follow-up steps so the sequence works out of the box.
+        followupsmod.seed_defaults(cid, followupsmod.DEFAULT_COUNT)
         return redirect(url_for("campaign", cid=cid))
     return render_template("campaign_new.html", user=current_user())
 
@@ -269,9 +260,50 @@ def campaign(cid):
     lead_rows = db.q("SELECT * FROM leads WHERE campaign_id=? ORDER BY id", (cid,))
     qstat = db.q("SELECT status, COUNT(*) c FROM send_queue WHERE campaign_id=? GROUP BY status", (cid,))
     job = db.q("SELECT * FROM jobs WHERE campaign_id=? ORDER BY id DESC LIMIT 1", (cid,), one=True)
+    fu_count = camp.get("followup_count") or followupsmod.DEFAULT_COUNT
+    fu_list = followupsmod.get_followups(cid, fu_count)
+    fu_map = {f["step"]: f for f in fu_list}
+    seq = _lead_seq_status(cid, fu_count)
     return render_template("campaign.html", campaign=camp, leads=lead_rows,
                            qstat={s["status"]: s["c"] for s in qstat}, job=job,
+                           fu_list=fu_list, fu_map=fu_map, fu_count=fu_count,
+                           fu_defaults=followupsmod.DEFAULT_FOLLOWUPS, seq=seq,
                            user=current_user())
+
+
+def _lead_seq_status(cid, fu_count):
+    """Per-lead sequence state for the campaign page: which step each lead is on."""
+    rows = db.q(
+        """SELECT l.id AS lid, l.replied,
+             (SELECT MAX(step) FROM send_log s WHERE s.campaign_id=? AND s.lead_id=l.id
+               AND s.status IN ('sent','dry-run')) AS max_sent,
+             (SELECT MIN(step) FROM send_queue q WHERE q.campaign_id=? AND q.lead_id=l.id
+               AND q.status='pending') AS next_step,
+             (SELECT COUNT(*) FROM send_log b WHERE b.campaign_id=? AND b.lead_id=l.id
+               AND b.status='bounced') AS bounced
+           FROM leads l WHERE l.campaign_id=?""",
+        (cid, cid, cid, cid))
+
+    def name(s):
+        return "Initial" if s == 0 else f"F{s}"
+
+    out = {}
+    for r in rows:
+        if r["replied"]:
+            out[r["lid"]] = ("Replied", "ok")
+        elif r["bounced"]:
+            out[r["lid"]] = ("Bounced", "bad")
+        else:
+            ms, ns = r["max_sent"], r["next_step"]
+            if ns is not None:
+                out[r["lid"]] = ((f"{name(ms)} sent, {name(ns)} queued" if ms is not None
+                                  else f"{name(ns)} queued"), "mut")
+            elif ms is not None:
+                out[r["lid"]] = ((f"{name(ms)} sent, done" if ms >= fu_count
+                                  else f"{name(ms)} sent"), "ok")
+            else:
+                out[r["lid"]] = ("-", "mut")
+    return out
 
 
 @app.route("/campaign/<int:cid>/import", methods=["POST"])
@@ -372,6 +404,28 @@ def campaign_template(cid):
           int(request.form.get("delay_max", 180) or 180),
           request.form.get("window_start", "09:00"), request.form.get("window_end", "17:00"),
           1 if request.form.get("dry_run") else 0, cid, uid()))
+    # Follow-up sequence settings. Only touch follow-up rows when the form
+    # actually carried follow-up fields (so API-style saves can't wipe them).
+    if "followup_count" in request.form:
+        fu_enabled = 1 if request.form.get("followups_enabled") else 0
+        try:
+            fu_count = int(request.form.get("followup_count", 5) or 5)
+        except ValueError:
+            fu_count = 5
+        fu_count = max(1, min(followupsmod.MAX_STEPS, fu_count))
+        try:
+            delay_h = int(request.form.get("followup_delay_hours", 40) or 40)
+        except ValueError:
+            delay_h = 40
+        delay_h = max(1, min(720, delay_h))
+        db.w("UPDATE campaigns SET followups_enabled=?, followup_count=?, "
+             "followup_delay_hours=? WHERE id=? AND user_id=?",
+             (fu_enabled, fu_count, delay_h, cid, uid()))
+        fu_count = followupsmod.set_count(cid, fu_count)
+        if any(f"fu_body_{s}" in request.form for s in range(1, followupsmod.MAX_STEPS + 1)):
+            for s in range(1, fu_count + 1):
+                followupsmod.upsert_followup(cid, s, request.form.get(f"fu_subject_{s}", ""),
+                                             request.form.get(f"fu_body_{s}", ""))
     return redirect(url_for("campaign", cid=cid))
 
 
@@ -402,8 +456,10 @@ def campaign_enqueue(cid):
     dry = db.q("SELECT dry_run FROM campaigns WHERE id=?", (cid,), one=True)["dry_run"]
     return render_template("message.html", title="Sending started",
                            message=f"Queued {n} leads. The scheduler cron processes them: "
-                                   f"randomized delays inside the sending window, rotating Gmail "
-                                   f"accounts, never exceeding caps."
+                                   f"randomized delays inside the sending window, rotating sender "
+                                   f"accounts, never exceeding caps. Follow-ups (if enabled) send "
+                                   f"one step at a time after the per-campaign interval, and stop "
+                                   f"for any lead that replies or bounces."
                                    + (" DRY-RUN is ON: nothing will actually be sent." if dry else ""),
                            back=url_for("campaign", cid=cid), user=current_user())
 
@@ -424,7 +480,7 @@ def logs():
                           le.business_name AS business
                    FROM send_log l
                    LEFT JOIN campaigns c ON c.id=l.campaign_id
-                   LEFT JOIN gmail_accounts a ON a.id=l.account_id
+                   LEFT JOIN sender_accounts a ON a.id=l.account_id
                    LEFT JOIN leads le ON le.id=l.lead_id
                    WHERE l.user_id=? ORDER BY l.id DESC LIMIT 300""", (uid(),))
     return render_template("logs.html", logs=rows, user=current_user())

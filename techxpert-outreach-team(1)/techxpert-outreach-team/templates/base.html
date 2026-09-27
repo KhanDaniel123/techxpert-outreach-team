@@ -1,25 +1,101 @@
-<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{% block t %}TechXpert Outreach{% endblock %}</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;max-width:1080px;margin:24px auto;padding:0 16px;color:#1a1a1a;background:#fafafa}
-nav{background:#111;color:#fff;padding:10px 16px;border-radius:8px;margin-bottom:20px;display:flex;gap:16px;align-items:center}
-nav a{color:#ffd34d;text-decoration:none;font-weight:600}
-nav .who{margin-left:auto;color:#bbb;font-size:13px}
-.card{background:#fff;border:1px solid #e3e3e3;border-radius:10px;padding:16px;margin-bottom:16px}
-table{border-collapse:collapse;width:100%;font-size:14px}
-th,td{border-bottom:1px solid #eee;padding:8px 6px;text-align:left;vertical-align:top}
-th{background:#f5f5f5}
-input,select,textarea{padding:8px;border:1px solid #ccc;border-radius:6px;font-size:14px;width:100%;box-sizing:border-box}
-textarea{font-family:monospace}
-button,.btn{background:#111;color:#ffd34d;border:0;border-radius:6px;padding:9px 16px;font-weight:700;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block}
-button.warn{background:#a33;color:#fff}
-button.ghost{background:#eee;color:#111}
-.row{display:flex;gap:12px;flex-wrap:wrap}.row>div{flex:1;min-width:180px}
-.pill{display:inline-block;padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700}
-.ok{background:#dff5df}.bad{background:#fdd}.mut{background:#eee}
-small{color:#666}.mono{font-family:monospace;font-size:12px}
-h1{font-size:24px}h2{font-size:19px;margin-top:0}
+:root{
+  --bg:#050b18; --bg2:#081226; --surface:#0b1526; --surface2:#0e1a30;
+  --border:#1b2a4a; --text:#e9f1fb; --muted:#8fa1bd; --faint:#5f7191;
+  --accent:#0085ff; --accent-deep:#0071db; --accent-hi:#67baff; --accent-hi2:#9bd8ff;
+  --accent-dim:rgba(0,133,255,.14);
+  --accent-glow:0 0 16px rgba(0,133,255,.45);
+  --ok:#34d399; --warn:#fbbf24; --bad:#f87171;
+  --radius:12px;
+}
+*{box-sizing:border-box}
+body{font-family:ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  max-width:1120px;margin:0 auto;padding:20px 18px 60px;color:var(--text);background:radial-gradient(1200px 520px at 50% -80px,#0d2242 0%,var(--bg) 62%) fixed,var(--bg);
+  line-height:1.5}
+a{color:var(--accent-hi)}
+h1{font-size:26px;font-weight:800;letter-spacing:-.02em;margin:6px 0 14px;color:#fff}
+h2{font-size:16px;font-weight:700;margin:0 0 10px;letter-spacing:-.01em;color:#fff}
+p{margin:8px 0}
+small{color:var(--muted)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}
+/* nav */
+nav{background:rgba(18,26,38,.85);backdrop-filter:blur(8px);border:1px solid var(--border);
+  padding:12px 18px;border-radius:var(--radius);margin-bottom:24px;display:flex;gap:20px;align-items:center;
+  position:sticky;top:12px;z-index:10}
+nav .brand{font-weight:800;font-size:16px;letter-spacing:-.01em;color:var(--text);text-decoration:none}
+nav .brand b{background:linear-gradient(135deg,var(--accent-hi2),var(--accent));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  filter:drop-shadow(0 0 10px rgba(0,133,255,.55))}
+nav a.nl{color:var(--muted);text-decoration:none;font-weight:600;font-size:14px}
+nav a.nl:hover{color:var(--accent-hi2)}
+nav .who{margin-left:auto;color:var(--faint);font-size:13px;display:flex;gap:14px;align-items:center}
+/* cards + layout */
+.card{background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--border);
+  border-radius:var(--radius);padding:20px;margin-bottom:18px;box-shadow:0 8px 28px rgba(0,0,0,.35)}
+.row{display:flex;gap:14px;flex-wrap:wrap}.row>div{flex:1;min-width:190px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:14px;margin-bottom:18px}
+.stat{background:linear-gradient(180deg,var(--surface2),var(--surface));border:1px solid var(--border);
+  border-radius:var(--radius);padding:16px 18px}
+.stat .n{font-size:30px;font-weight:800;letter-spacing:-.02em;background:linear-gradient(135deg,var(--accent-hi2),var(--accent));
+  -webkit-background-clip:text;background-clip:text;color:transparent;
+  filter:drop-shadow(0 0 12px rgba(0,133,255,.4))}
+.stat .l{font-size:12.5px;color:var(--muted);font-weight:600;text-transform:uppercase;letter-spacing:.06em;margin-top:2px}
+/* tables */
+.twrap{overflow-x:auto;margin:0 -4px;padding:0 4px}
+table{border-collapse:collapse;width:100%;font-size:14px;min-width:560px}
+th,td{border-bottom:1px solid var(--border);padding:10px 8px;text-align:left;vertical-align:top}
+th{color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:700;background:transparent}
+/* forms */
+label small{display:block;margin-bottom:4px;font-weight:600}
+input,select,textarea{padding:10px 12px;border:1px solid var(--border);border-radius:8px;font-size:14px;
+  width:100%;box-sizing:border-box;background:var(--bg2);color:var(--text)}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-dim)}
+textarea{font-family:ui-monospace,Menlo,Consolas,monospace}
+input[type=checkbox]{width:auto;accent-color:var(--accent)}
+button,.btn{background:linear-gradient(180deg,var(--accent),var(--accent-deep));color:#fff;border:0;border-radius:8px;padding:10px 18px;
+  font-weight:800;cursor:pointer;font-size:14px;text-decoration:none;display:inline-block;
+  box-shadow:var(--accent-glow);transition:transform .08s ease,filter .08s ease}
+button:hover,.btn:hover{transform:translateY(-1px);filter:brightness(1.12)}
+button.warn{background:var(--bad);color:#1a0505;box-shadow:none}
+button.ghost,.btn.ghost{background:var(--surface2);color:var(--text);border:1px solid var(--border);box-shadow:none}
+button.ghost:hover,.btn.ghost:hover{border-color:var(--accent);color:var(--accent-hi2)}
+/* pills */
+.pill{display:inline-block;padding:3px 12px;border-radius:20px;font-size:12px;font-weight:700;white-space:nowrap}
+.ok{background:rgba(52,211,153,.15);color:var(--ok);border:1px solid rgba(52,211,153,.35)}
+.bad{background:rgba(248,113,113,.12);color:var(--bad);border:1px solid rgba(248,113,113,.35)}
+.mut{background:rgba(139,152,173,.12);color:var(--muted);border:1px solid var(--border)}
+.live{background:rgba(0,133,255,.16);color:var(--accent-hi2);border:1px solid rgba(0,133,255,.5);box-shadow:var(--accent-glow)}
+/* hero: LinkedIn-banner energy - vivid blue gradient, bold white type */
+.hero{background:linear-gradient(120deg,#0066d6 0%,#0085ff 48%,#3aa8ff 100%);
+  border-radius:var(--radius);padding:26px 26px;margin-bottom:18px;color:#fff;
+  box-shadow:0 10px 34px rgba(0,133,255,.35),inset 0 1px 0 rgba(255,255,255,.25);
+  position:relative;overflow:hidden;border:1px solid rgba(155,216,255,.35)}
+.hero::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(620px 220px at 88% 18%,rgba(155,216,255,.55),transparent 70%)}
+.hero h1{color:#fff;margin:0 0 6px;font-size:30px;font-weight:800;letter-spacing:-.02em;
+  text-shadow:0 2px 14px rgba(0,40,90,.4);position:relative;z-index:1}
+.hero p{color:#f2f8ff;margin:0;position:relative;z-index:1;font-weight:500}
+.hero small{color:#d9ecff}
+/* misc */
+.actions{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0}
+.hr{border:0;border-top:1px solid var(--border);margin:16px 0}
+.alert{background:rgba(248,113,113,.1);border:1px solid rgba(248,113,113,.4);color:#fecaca;
+  border-radius:8px;padding:10px 14px;font-size:14px;margin-bottom:14px}
+.notice{background:var(--accent-dim);border:1px solid rgba(0,133,255,.4);color:var(--accent-hi2);
+  border-radius:8px;padding:10px 14px;font-size:14px;margin-bottom:14px}
+.authwrap{max-width:440px;margin:8vh auto 0}
+.authwrap .logo{text-align:center;margin-bottom:18px}
+.authwrap .logo .mark{display:inline-block;padding:9px 26px;border-radius:999px;
+  background:linear-gradient(120deg,#0066d6,#0085ff 60%,#3aa8ff);color:#fff;
+  font-size:14px;font-weight:800;letter-spacing:.14em;text-transform:uppercase;
+  box-shadow:0 6px 24px rgba(0,133,255,.5),inset 0 1px 0 rgba(255,255,255,.3)}
+.authwrap h1{text-align:center;font-size:22px}
+.steps{margin:10px 0;padding-left:20px;color:var(--muted);font-size:14px}
+.steps li{margin:6px 0}
+@media(max-width:640px){h1{font-size:22px}nav{gap:12px;padding:10px 12px}nav a.nl{font-size:13px}.card{padding:14px}}
 </style></head><body>
-<nav><a href="/dashboard">TechXpert Outreach</a><a href="/accounts">Gmail accounts</a><a href="/logs">Send log</a>{% if user %}<a href="/logout">Logout</a><span class="who">{{ user.email }}</span>{% endif %}</nav>
+<nav><a class="brand" href="/dashboard">TechXpert <b>Outreach</b></a>{% if user %}<a class="nl" href="/dashboard">Dashboard</a><a class="nl" href="/accounts">Sender accounts</a><a class="nl" href="/logs">Send log</a><span class="who"><span>{{ user.email }}</span><a class="nl" href="/logout">Logout</a></span>{% endif %}</nav>
 {% block b %}{% endblock %}
 </body></html>

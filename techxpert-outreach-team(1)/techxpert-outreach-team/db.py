@@ -9,12 +9,19 @@ modules (sender, leads, jobs, queue_worker) barely change:
     init_db()                   -> create all tables if missing
 
 Write SQL with `?` placeholders; they are translated to `%s` on Postgres.
+
+V2 schema note: this version uses built-in email+password auth and Gmail
+SMTP via App Passwords. The tables `app_users` and `sender_accounts` are
+new. If this database was previously used by the Google-OAuth version, its
+old `users` (google_sub) and `gmail_accounts` (OAuth tokens) tables are
+left untouched and ignored - create_all() only adds tables that do not
+exist yet (CREATE TABLE IF NOT EXISTS), and no data is ever deleted.
 """
 import os
 import time
 
 from sqlalchemy import (create_engine, MetaData, Table, Column, Integer,
-                        BigInteger, Text, Float, text as _sd)
+                        Text, Float, text as _sd)
 
 import config
 
@@ -46,26 +53,31 @@ else:
 
 metadata = MetaData()
 
-users = Table("users", metadata,
-              Column("id", Integer, primary_key=True, autoincrement=True),
-              Column("google_sub", Text, unique=True, nullable=False),
-              Column("email", Text, nullable=False),
-              Column("name", Text, default=""),
-              Column("created_at", Float, nullable=False))
+# V2 users: built-in email + password auth. (The old google-based `users`
+# table, if present from the previous version, is ignored.)
+app_users = Table("app_users", metadata,
+                  Column("id", Integer, primary_key=True, autoincrement=True),
+                  Column("email", Text, unique=True, nullable=False),
+                  Column("name", Text, default=""),
+                  Column("password_hash", Text, nullable=False),
+                  Column("created_at", Float, nullable=False))
 
-gmail_accounts = Table("gmail_accounts", metadata,
-                       Column("id", Integer, primary_key=True, autoincrement=True),
-                       Column("user_id", Integer, nullable=False),
-                       Column("email", Text, nullable=False),
-                       Column("token_enc", Text, nullable=False),
-                       Column("daily_cap", Integer, nullable=False, server_default="30"),
-                       Column("warmup_enabled", Integer, nullable=False, server_default="1"),
-                       Column("warmup_start", Float, nullable=False),
-                       Column("status", Text, nullable=False, server_default=_sd("'active'")),
-                       Column("sent_today", Integer, nullable=False, server_default="0"),
-                       Column("sent_date", Text, nullable=False, server_default=_sd("''")),
-                       Column("last_account_note", Text, default=""),
-                       Column("created_at", Float, nullable=False))
+# V2 sender accounts: Gmail address + Fernet-encrypted App Password for
+# direct SMTP sending (smtp.gmail.com:587) and IMAP bounce scans.
+# (The old OAuth-based `gmail_accounts` table, if present, is ignored.)
+sender_accounts = Table("sender_accounts", metadata,
+                        Column("id", Integer, primary_key=True, autoincrement=True),
+                        Column("user_id", Integer, nullable=False),
+                        Column("email", Text, nullable=False),
+                        Column("password_enc", Text, nullable=False),
+                        Column("daily_cap", Integer, nullable=False, server_default="30"),
+                        Column("warmup_enabled", Integer, nullable=False, server_default="1"),
+                        Column("warmup_start", Float, nullable=False),
+                        Column("status", Text, nullable=False, server_default=_sd("'active'")),
+                        Column("sent_today", Integer, nullable=False, server_default="0"),
+                        Column("sent_date", Text, nullable=False, server_default=_sd("''")),
+                        Column("last_account_note", Text, default=""),
+                        Column("created_at", Float, nullable=False))
 
 campaigns = Table("campaigns", metadata,
                   Column("id", Integer, primary_key=True, autoincrement=True),
@@ -81,6 +93,9 @@ campaigns = Table("campaigns", metadata,
                   Column("window_start", Text, nullable=False, server_default=_sd("'09:00'")),
                   Column("window_end", Text, nullable=False, server_default=_sd("'17:00'")),
                   Column("dry_run", Integer, nullable=False, server_default="1"),
+                  Column("followups_enabled", Integer, nullable=False, server_default="1"),
+                  Column("followup_count", Integer, nullable=False, server_default="5"),
+                  Column("followup_delay_hours", Integer, nullable=False, server_default="40"),
                   Column("status", Text, nullable=False, server_default=_sd("'draft'")),
                   Column("next_send_at", Float),  # nullable; worker treats None as 0
                   Column("last_account_id", Integer, default=0),
@@ -104,6 +119,8 @@ leads = Table("leads", metadata,
               Column("source", Text, default="csv"),
               Column("notes", Text, default=""),
               Column("selected", Integer, nullable=False, server_default="1"),
+              Column("replied", Integer, nullable=False, server_default="0"),
+              # replied=1: lead replied (via IMAP reply scan); sequence stops
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
@@ -113,7 +130,20 @@ send_queue = Table("send_queue", metadata,
                    Column("status", Text, nullable=False, server_default=_sd("'pending'")),
                    Column("scheduled_at", Float, nullable=False, server_default="0"),
                    Column("attempts", Integer, nullable=False, server_default="0"),
+                   Column("step", Integer, nullable=False, server_default="0"),
+                   # step 0 = initial message, 1..10 = follow-up N
                    Column("last_error", Text, default=""))
+
+# Follow-up sequence templates, per campaign. Steps are 1..10; the campaign
+# row controls whether follow-ups are enabled, how many steps run, and the
+# hours between steps. A missing/blank step ends the chain there.
+followups = Table("followups", metadata,
+                  Column("id", Integer, primary_key=True, autoincrement=True),
+                  Column("campaign_id", Integer, nullable=False),
+                  Column("step", Integer, nullable=False),  # 1..10
+                  Column("subject_tpl", Text, default=""),
+                  Column("body_tpl", Text, default=""),
+                  Column("created_at", Float, nullable=False))
 
 send_log = Table("send_log", metadata,
                  Column("id", Integer, primary_key=True, autoincrement=True),
@@ -121,6 +151,8 @@ send_log = Table("send_log", metadata,
                  Column("campaign_id", Integer),
                  Column("account_id", Integer),
                  Column("lead_id", Integer),
+                 Column("step", Integer, nullable=False, server_default="0"),
+                 # step 0 = initial message, 1..10 = follow-up N
                  Column("recipient", Text, nullable=False),
                  Column("subject_rendered", Text, default=""),
                  Column("sent_at", Float, nullable=False),
@@ -142,7 +174,48 @@ jobs = Table("jobs", metadata,
 
 
 def init_db():
+    # CREATE TABLE IF NOT EXISTS under the hood; safe to run on every boot,
+    # including against a database created by the previous Google-OAuth version.
     metadata.create_all(engine)
+    _migrate()
+
+
+def _migrate():
+    """Idempotent column migrations for tables created by earlier versions.
+
+    create_all() only adds missing TABLES, not missing columns, so new
+    columns on old tables (e.g. the production Neon database, which already
+    has campaigns/leads/send_queue/send_log from the previous version) are
+    added here. Runs on every boot; zero manual SQL needed. Never touches
+    the old Google-OAuth tables (users, gmail_accounts) or any existing data.
+    """
+    want = {
+        "campaigns": ["followups_enabled INTEGER DEFAULT 1",
+                      "followup_count INTEGER DEFAULT 5",
+                      "followup_delay_hours INTEGER DEFAULT 40"],
+        "send_queue": ["step INTEGER DEFAULT 0"],
+        "send_log": ["step INTEGER DEFAULT 0"],
+        "leads": ["replied INTEGER DEFAULT 0"],
+    }
+    for table, cols in want.items():
+        for ddl in cols:
+            _add_column(table, ddl)
+
+
+def _add_column(table, ddl):
+    name = ddl.split()[0]
+    try:
+        from sqlalchemy import text
+        with engine.begin() as con:
+            if IS_POSTGRES:
+                con.execute(text(f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {ddl}"))
+            else:
+                existing = [r[1] for r in con.execute(
+                    text(f"PRAGMA table_info({table})")).fetchall()]
+                if name not in existing:
+                    con.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+    except Exception:
+        pass
 
 
 def _prep(sql):
@@ -198,18 +271,17 @@ def w(sql, args=()):
         return None
 
 
-# ---------------- users ----------------
+# ---------------- users (built-in auth) ----------------
 
 def get_user(uid):
-    return q("SELECT * FROM users WHERE id=?", (uid,), one=True)
+    return q("SELECT * FROM app_users WHERE id=?", (uid,), one=True)
 
 
-def get_or_create_user(google_sub, email, name):
-    row = q("SELECT * FROM users WHERE google_sub=?", (google_sub,), one=True)
-    if row:
-        # keep name/email fresh
-        w("UPDATE users SET email=?, name=? WHERE id=?", (email, name or "", row["id"]))
-        return q("SELECT * FROM users WHERE id=?", (row["id"],), one=True)
-    wid = w("INSERT INTO users (google_sub, email, name, created_at) VALUES (?,?,?,?)",
-            (google_sub, email, name or "", time.time()))
-    return q("SELECT * FROM users WHERE id=?", (wid,), one=True)
+def get_user_by_email(email):
+    return q("SELECT * FROM app_users WHERE email=?", (email,), one=True)
+
+
+def create_user(email, name, password_hash):
+    wid = w("INSERT INTO app_users (email, name, password_hash, created_at) VALUES (?,?,?,?)",
+            (email, name or "", password_hash, time.time()))
+    return q("SELECT * FROM app_users WHERE id=?", (wid,), one=True)

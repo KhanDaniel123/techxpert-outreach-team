@@ -1,6 +1,9 @@
 """Sending engine: spintax, variables, account rotation, caps, warmup,
 randomized delays, sending window, dry-run, send log, bounce auto-pause.
 
+Sending goes through Gmail SMTP (smtp.gmail.com:587) using each sender
+account's stored App Password - no Google OAuth involved.
+
 Serverless note: there is no background thread here. queue_worker.process_sends()
 is invoked by POST /api/process-queue (cron). Sending windows are evaluated in
 server local time (UTC on Vercel); set windows accordingly (see README).
@@ -11,6 +14,7 @@ import time
 from datetime import datetime, timedelta
 
 import db
+import followups
 
 SPINTAX_RE = re.compile(r"\{([^{}]*\|[^{}]*)\}")
 VAR_RE = re.compile(r"\{([a-zA-Z_][a-zA-Z0-9_]*)\}")
@@ -74,9 +78,9 @@ def _today_str():
 
 def reset_daily_counter_if_needed(account):
     if account["sent_date"] != _today_str():
-        db.w("UPDATE gmail_accounts SET sent_today=0, sent_date=? WHERE id=?",
+        db.w("UPDATE sender_accounts SET sent_today=0, sent_date=? WHERE id=?",
              (_today_str(), account["id"]))
-        account = db.q("SELECT * FROM gmail_accounts WHERE id=?", (account["id"],), one=True)
+        account = db.q("SELECT * FROM sender_accounts WHERE id=?", (account["id"],), one=True)
     return account
 
 
@@ -109,7 +113,7 @@ def next_window_open(campaign, now=None):
 
 
 def eligible_accounts(user_id, campaign):
-    accts = db.q("SELECT * FROM gmail_accounts WHERE user_id=? AND status='active' ORDER BY id",
+    accts = db.q("SELECT * FROM sender_accounts WHERE user_id=? AND status='active' ORDER BY id",
                  (user_id,))
     out = []
     for a in accts:
@@ -141,30 +145,88 @@ def pick_account(user_id, campaign):
 
 
 def record_send(user_id, campaign_id, account_id, lead_id, recipient,
-                subject, status, error="", dry_run=False):
+                subject, status, error="", dry_run=False, step=0):
     lid = db.w(
-        """INSERT INTO send_log (user_id, campaign_id, account_id, lead_id,
+        """INSERT INTO send_log (user_id, campaign_id, account_id, lead_id, step,
            recipient, subject_rendered, sent_at, status, error, dry_run)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-        (user_id, campaign_id, account_id, lead_id, recipient, subject,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        (user_id, campaign_id, account_id, lead_id, step, recipient, subject,
          time.time(), status, error, 1 if dry_run else 0))
     if not dry_run and status == "sent" and account_id:
-        db.w("UPDATE gmail_accounts SET sent_today = sent_today + 1 WHERE id=?", (account_id,))
+        db.w("UPDATE sender_accounts SET sent_today = sent_today + 1 WHERE id=?", (account_id,))
     return lid
 
 
-def send_one(user_id, campaign, lead, send_fn=None, rng=None):
+def _templates_for(campaign, step):
+    """Return (subject_tpl, body_tpl) for a queue step.
+    Step 0 = the campaign's main template; steps 1..10 = follow-up rows."""
+    if step and step > 0:
+        fu = db.q("SELECT * FROM followups WHERE campaign_id=? AND step=?",
+                  (campaign["id"], step), one=True)
+        if not fu or not (fu["body_tpl"] or "").strip():
+            return None, None
+        return fu["subject_tpl"] or "", fu["body_tpl"]
+    return campaign["subject_tpl"], campaign["body_tpl"]
+
+
+def sequence_gate(user_id, campaign_id, lead, step):
+    """Decide whether follow-up `step` (>0) may be sent to this lead.
+
+    Rules: follow-ups are only enabled when the campaign says so, and a
+    follow-up only sends if the previous step sent successfully AND no reply
+    was detected AND the address did not bounce.
+    Returns (allowed: bool, reason: str).
+    """
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campaign_id,), one=True)
+    if camp and not followups.is_enabled(camp):
+        return False, "Follow-ups are disabled for this campaign."
+    if lead.get("replied"):
+        return False, "Lead replied; sequence stopped."
+    bounced = db.q(
+        "SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? AND status='bounced' LIMIT 1",
+        (campaign_id, lead["id"]), one=True)
+    if bounced:
+        return False, "Address bounced; sequence stopped."
+    prev = db.q(
+        "SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? AND step=? AND status IN ('sent','dry-run') LIMIT 1",
+        (campaign_id, lead["id"], step - 1), one=True)
+    if not prev:
+        return False, f"Previous step ({step - 1}) did not send successfully; sequence stopped."
+    return True, ""
+
+
+def mark_replies(user_id, reply_addrs):
+    """Mark leads as replied for any matching address. Returns count marked."""
+    marked = 0
+    for addr in set((a or "").lower() for a in reply_addrs or []):
+        if "@" not in addr:
+            continue
+        rows = db.q("SELECT id FROM leads WHERE user_id=? AND lower(email)=? AND replied=0",
+                    (user_id, addr))
+        for r in rows:
+            db.w("UPDATE leads SET replied=1 WHERE id=?", (r["id"],))
+            marked += 1
+    return marked
+
+
+def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
     """Send (or dry-run) a single message. send_fn(account, to, subject, body)
-    defaults to the real Gmail API path. Returns dict with outcome details."""
+    defaults to the real Gmail SMTP path. `step` selects the template:
+    0 = main template, 1..10 = follow-up step. Returns dict with outcome details."""
     rng = rng or random
     account = pick_account(user_id, campaign)
     if not account:
         return {"ok": False, "reason": "no_eligible_account",
-                "detail": "No active Gmail account under its daily cap inside the sending window."}
+                "detail": "No active sender account under its daily cap inside the sending window."}
+
+    subject_tpl, body_tpl = _templates_for(campaign, step)
+    if body_tpl is None:
+        return {"ok": False, "reason": "no_followup_template",
+                "detail": f"Follow-up step {step} has no template; sequence ends here."}
 
     tpl_ctx = dict(lead)
-    subject = render_template(campaign["subject_tpl"], tpl_ctx, rng)
-    body = render_template(campaign["body_tpl"], tpl_ctx, rng)
+    subject = render_template(subject_tpl, tpl_ctx, rng)
+    body = render_template(body_tpl, tpl_ctx, rng)
     recipient = (lead["email"] or "").strip()
     if not recipient:
         return {"ok": False, "reason": "no_email", "detail": "Lead has no email address."}
@@ -173,41 +235,40 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None):
 
     if campaign["dry_run"]:
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="dry-run", dry_run=True)
+                    recipient, subject, status="dry-run", dry_run=True, step=step)
         return {"ok": True, "dry_run": True, "account": account["email"],
-                "to": recipient, "subject": subject,
+                "to": recipient, "subject": subject, "step": step,
                 "intended_delay_s": intended_delay,
                 "note": "Dry-run: nothing was sent. Delay simulated, not slept."}
 
     try:
         if send_fn is None:
-            import gmail_oauth
-            service = gmail_oauth.get_service(account)
-            gmail_oauth.send_message(service, recipient, subject, body)
+            import smtp_mail
+            smtp_mail.send_message(account, recipient, subject, body)
         else:
             send_fn(account, recipient, subject, body)
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="sent")
+                    recipient, subject, status="sent", step=step)
         return {"ok": True, "account": account["email"], "to": recipient,
-                "subject": subject, "delay_s": intended_delay}
+                "subject": subject, "step": step, "delay_s": intended_delay}
     except Exception as e:
         err = str(e)[:300]
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="failed", error=err)
+                    recipient, subject, status="failed", error=err, step=step)
         return {"ok": False, "reason": "send_failed", "detail": err}
 
 
-def check_account_bounces(user_id, account_id, service=None, bounce_addrs=None):
-    """Scan recent bounces; mark log rows; auto-pause account if bounce rate spikes.
+def check_account_bounces(user_id, account_id, bounce_addrs=None):
+    """Scan recent bounces via IMAP; mark log rows; auto-pause account if
+    bounce rate spikes.
 
-    bounce_addrs: override list (used by tests). Otherwise uses Gmail API scan.
+    bounce_addrs: override list (used by tests). Otherwise uses the IMAP scan.
     Returns dict with bounced count, rate, paused flag.
     """
     if bounce_addrs is None:
-        import gmail_oauth
-        account = db.q("SELECT * FROM gmail_accounts WHERE id=?", (account_id,), one=True)
-        service = gmail_oauth.get_service(account) if service is None else service
-        bounce_addrs = gmail_oauth.scan_bounces(service)
+        import smtp_mail
+        account = db.q("SELECT * FROM sender_accounts WHERE id=?", (account_id,), one=True)
+        bounce_addrs = smtp_mail.scan_bounces(account) if account else []
     bounce_set = set(a.lower() for a in bounce_addrs)
 
     marked = 0
@@ -229,7 +290,7 @@ def check_account_bounces(user_id, account_id, service=None, bounce_addrs=None):
 
     paused = False
     if rate > BOUNCE_PAUSE_RATE and len(recent) >= 10:
-        db.w("UPDATE gmail_accounts SET status='paused' WHERE id=?", (account_id,))
+        db.w("UPDATE sender_accounts SET status='paused' WHERE id=?", (account_id,))
         paused = True
     return {"bounced_marked": marked, "bounce_rate": round(rate, 3),
             "looked_at": len(recent), "paused": paused}

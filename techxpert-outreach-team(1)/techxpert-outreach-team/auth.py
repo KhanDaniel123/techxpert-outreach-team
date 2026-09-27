@@ -1,47 +1,46 @@
-"""Google Sign-In (login) flow. Separate from the Gmail-connect flow in
-gmail_oauth.py: login uses openid/email/profile scopes only; connecting a
-Gmail account for sending uses the restricted gmail.send + gmail.readonly
-scopes and stores an encrypted token per account.
+"""Built-in email + password authentication (no Google Sign-In).
+
+Registration is open: anyone with the app URL can create an account.
+This is a private team-tool URL, so that is the intended access model.
+Passwords are hashed with werkzeug PBKDF2; plaintext passwords never
+touch the database and are never logged.
 """
-import json
+import re
 
-import requests
+from werkzeug.security import generate_password_hash, check_password_hash
 
-import config
+import db
 
-LOGIN_SCOPES = [
-    "openid",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+MIN_PASSWORD_LEN = 8
 
 
-def make_login_flow(state=None):
-    from google_auth_oauthlib.flow import Flow
-    if not config.OAUTH_READY:
-        raise RuntimeError(
-            "Google OAuth not configured. Set GOOGLE_CLIENT_ID and "
-            "GOOGLE_CLIENT_SECRET env vars (see README).")
-    return Flow.from_client_config(
-        {"web": {"client_id": config.GOOGLE_CLIENT_ID,
-                 "client_secret": config.GOOGLE_CLIENT_SECRET,
-                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
-                 "token_uri": "https://oauth2.googleapis.com/token",
-                 "redirect_uris": [config.LOGIN_REDIRECT_URI]}},
-        scopes=LOGIN_SCOPES, state=state,
-        redirect_uri=config.LOGIN_REDIRECT_URI)
+def _clean_email(email):
+    return (email or "").strip().lower()
 
 
-def fetch_userinfo(credentials):
-    """Return (google_sub, email, name) for the authenticated Google user."""
-    r = requests.get("https://www.googleapis.com/oauth2/v3/userinfo",
-                     headers={"Authorization": f"Bearer {credentials.token}"},
-                     timeout=20)
-    r.raise_for_status()
-    info = r.json()
-    sub = info.get("sub", "")
-    email = info.get("email", "")
-    name = info.get("name", "") or email.split("@")[0]
-    if not sub or not email:
-        raise RuntimeError("Google did not return a user identity.")
-    return sub, email, name
+def register_user(email, name, password):
+    """Create a new user. Returns (ok: bool, payload: dict|str error)."""
+    email = _clean_email(email)
+    name = (name or "").strip() or email.split("@")[0]
+    if not EMAIL_RE.match(email):
+        return False, "Enter a valid email address."
+    if not password or len(password) < MIN_PASSWORD_LEN:
+        return False, f"Password must be at least {MIN_PASSWORD_LEN} characters."
+    if db.get_user_by_email(email):
+        return False, "An account with that email already exists. Try logging in."
+    user = db.create_user(email, name, generate_password_hash(password))
+    return True, user
+
+
+def verify_login(email, password):
+    """Return the user dict when credentials are valid, else None."""
+    user = db.get_user_by_email(_clean_email(email))
+    if not user:
+        return None
+    try:
+        if check_password_hash(user["password_hash"], password or ""):
+            return user
+    except Exception:
+        pass
+    return None

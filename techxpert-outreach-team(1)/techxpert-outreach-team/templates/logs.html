@@ -1,11 +1,12 @@
 {% extends "base.html" %}{% block t %}Send log{% endblock %}{% block b %}
 <h1>Send log</h1>
-<div class="card"><table><tr><th>Time</th><th>Campaign</th><th>Account</th><th>To</th><th>Subject</th><th>Status</th><th>Error</th></tr>
+<div class="card"><div class="twrap"><table><tr><th>Time</th><th>Campaign</th><th>Step</th><th>Account</th><th>To</th><th>Subject</th><th>Status</th><th>Error</th></tr>
 {% for l in logs %}<tr><td class="mono"><small>{{ l.sent_at|int }}</small></td><td>{{ l.campaign_name or '' }}</td>
+<td><span class="pill mut">{{ 'Initial' if (l.step or 0)==0 else 'F' ~ (l.step or 0) }}</span></td>
 <td class="mono">{{ l.account_email or '' }}</td><td class="mono">{{ l.recipient }}</td>
 <td>{{ l.subject_rendered[:60] }}</td>
 <td><span class="pill {{ 'ok' if l.status=='sent' else ('bad' if l.status in ('failed','bounced') else 'mut') }}">{{ l.status }}</span>{% if l.dry_run %} <small>(dry)</small>{% endif %}</td>
 <td><small>{{ l.error[:80] }}</small></td></tr>
-{% else %}<tr><td colspan="7"><small>No sends logged yet.</small></td></tr>{% endfor %}</table>
+{% else %}<tr><td colspan="8"><small>No sends logged yet.</small></td></tr>{% endfor %}</table></div>
 <p><small>Times are Unix timestamps (UTC on Vercel). Latest 300 shown.</small></p></div>
 {% endblock %}

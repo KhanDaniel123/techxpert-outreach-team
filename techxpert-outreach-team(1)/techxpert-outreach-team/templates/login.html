@@ -1,8 +1,16 @@
-{% extends "base.html" %}{% block t %}Sign in{% endblock %}{% block b %}
-<div class="card" style="max-width:480px;margin:60px auto;text-align:center">
-<h1>TechXpert Outreach</h1>
-<p><small>Team outreach automation: lead discovery, enrichment, email validation, and Gmail sending with rotation, caps, and warmup.</small></p>
-<p><a class="btn" href="/login/start">Sign in with Google</a></p>
-<p><small>Your campaigns, Gmail connections, and leads are tied to your Google account. You only ever see your own data.</small></p>
+{% extends "base.html" %}{% block t %}Log in{% endblock %}{% block b %}
+<div class="authwrap">
+<div class="logo"><div class="mark">TechXpert Outreach</div></div>
+<div class="card">
+<h1>Welcome back</h1>
+{% if error %}<div class="alert">{{ error }}</div>{% endif %}
+<form method="post">
+<p><label><small>Email</small></label><input type="email" name="email" required autocomplete="email" placeholder="you@example.com"></p>
+<p><label><small>Password</small></label><input type="password" name="password" required autocomplete="current-password" placeholder="Your password"></p>
+<p><button type="submit" style="width:100%">Log in</button></p>
+</form>
+<p style="text-align:center"><small>No account yet? <a href="/register">Create one</a></small></p>
+</div>
+<p style="text-align:center"><small>Your campaigns, sender accounts, and leads are private to your login.</small></p>
 </div>
 {% endblock %}

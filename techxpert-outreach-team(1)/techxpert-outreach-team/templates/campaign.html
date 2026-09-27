@@ -1,10 +1,10 @@
 {% extends "base.html" %}{% block t %}{{ campaign.name }}{% endblock %}{% block b %}
 <h1>{{ campaign.name }} <span class="pill mut">{{ campaign.status }}</span>
-{% if campaign.dry_run %}<span class="pill ok">DRY-RUN</span>{% else %}<span class="pill bad">LIVE</span>{% endif %}</h1>
+{% if campaign.dry_run %}<span class="pill mut">DRY-RUN</span>{% else %}<span class="pill live">LIVE</span>{% endif %}</h1>
 <p><small>{{ campaign.niche }} | {{ campaign.location }} | delays {{ campaign.delay_min }}-{{ campaign.delay_max }}s | window {{ campaign.window_start }}-{{ campaign.window_end }} (server time, UTC on Vercel)</small></p>
 
 <div class="card"><h2>Leads ({{ leads|length }})</h2>
-<div style="display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap">
+<div class="actions">
 <form method="post" action="/campaign/{{ campaign.id }}/import" enctype="multipart/form-data">
 <input type="file" name="csvfile" accept=".csv" required style="width:auto"><button type="submit">Import CSV</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/sample"><button class="ghost" type="submit">Load sample leads</button></form>
@@ -21,7 +21,7 @@
 <div><input name="email" placeholder="Email"></div>
 <div><input name="phone" placeholder="Phone"></div>
 <div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
-<table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Email verdict</th><th>Form?</th><th>Notes</th></tr>
+<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Form?</th><th>Sequence</th><th>Notes</th></tr>
 {% for l in leads %}<tr>
 <td><form method="post" action="/campaign/{{ campaign.id }}/toggle_lead">
 <input type="hidden" name="lead_id" value="{{ l.id }}">
@@ -31,8 +31,9 @@
 <td class="mono">{{ l.email }}</td>
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
 <td>{{ 'yes' if l.has_contact_form else '' }}</td>
+<td><span class="pill {{ seq.get(l.id, ('-', 'mut'))[1] }}">{{ seq.get(l.id, ('-', 'mut'))[0] }}</span></td>
 <td><small>{{ l.notes }}</small></td></tr>
-{% else %}<tr><td colspan="8"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div>
+{% else %}<tr><td colspan="9"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
 
 <div class="card"><h2>Message template</h2>
 <form method="post" action="/campaign/{{ campaign.id }}/template">
@@ -45,15 +46,49 @@
 <div><label><small>Window start (server time)</small></label><input type="time" name="window_start" value="{{ campaign.window_start }}"></div>
 <div><label><small>Window end (server time)</small></label><input type="time" name="window_end" value="{{ campaign.window_end }}"></div></div>
 <p><label><input type="checkbox" name="dry_run" {{ 'checked' if campaign.dry_run }} style="width:auto"> Dry-run mode (log, don't send)</label></p>
+
+<hr style="margin:18px 0;border-color:#1b2a4a">
+<h2>Follow-up sequence</h2>
+<p><label><input type="checkbox" name="followups_enabled" {{ 'checked' if campaign.followups_enabled }} style="width:auto"> Enable follow-ups</label></p>
+<div class="row">
+<div><label><small>Number of follow-ups (1-10)</small></label><input type="number" id="fu_count" name="followup_count" min="1" max="10" value="{{ fu_count }}"></div>
+<div><label><small>Hours between steps</small></label><input type="number" name="followup_delay_hours" min="1" max="720" value="{{ campaign.followup_delay_hours or 40 }}"></div></div>
+<p><small class="mut">A follow-up sends only if the previous step sent successfully, no reply was detected, and the address did not bounce. The form shows exactly the steps above; each has its own subject and body with the same {variables} and {a|b} spintax. Leave a step's body empty to end the sequence there.</small></p>
+<div id="fu_steps">
+{% for s in range(1, 11) %}
+{% set fu = fu_map.get(s) %}
+{% set dflt = fu_defaults[s-1] %}
+<div class="fu-step card" data-step="{{ s }}"{% if s > fu_count %} hidden{% endif %} style="margin:10px 0">
+<h3>Follow-up {{ s }}</h3>
+<p><label><small>Subject</small></label><input name="fu_subject_{{ s }}" value="{{ fu.subject_tpl if fu else dflt[1] }}"></p>
+<p><label><small>Body</small></label><textarea name="fu_body_{{ s }}" rows="4">{{ fu.body_tpl if fu else dflt[2] }}</textarea></p>
+</div>
+{% endfor %}
+</div>
+<script>
+(function(){
+  var c = document.getElementById('fu_count');
+  function syncFu(){
+    var n = parseInt(c.value || '5', 10);
+    if (isNaN(n)) n = 5;
+    n = Math.max(1, Math.min(10, n));
+    document.querySelectorAll('.fu-step').forEach(function(el){
+      el.hidden = parseInt(el.getAttribute('data-step'), 10) > n;
+    });
+  }
+  c.addEventListener('input', syncFu);
+})();
+</script>
+
 <p><button type="submit">Save template</button>
 <button type="button" class="ghost" onclick="fetch('/campaign/{{ campaign.id }}/preview',{method:'POST'}).then(r=>r.json()).then(j=>alert('TO: '+j.to+'\nSUBJECT: '+j.subject+'\n\n'+j.body))">Preview render</button></p>
 </form></div>
 
 <div class="card"><h2>Send queue</h2>
 <p>{% for s,c in qstat.items() %}<span class="pill mut">{{ s }}: {{ c }}</span> {% endfor %}{% if not qstat %}<small>Queue empty.</small>{% endif %}</p>
-<div style="display:flex;gap:8px">
+<div class="actions">
 <form method="post" action="/campaign/{{ campaign.id }}/enqueue"><button type="submit">Queue selected leads &amp; start sending</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/stop"><button class="warn" type="submit">Stop</button></form>
 </div>
-<p><small>The scheduler cron processes the queue: up to 5 messages per tick per campaign, random delay spacing between ticks, only inside the window, rotating Gmail accounts, never exceeding caps. In dry-run mode it logs intended sends without emailing.</small></p></div>
+<p><small>The scheduler cron processes the queue: up to 5 messages per tick per campaign, random delay spacing between ticks, only inside the window, rotating sender accounts, never exceeding caps. In dry-run mode it logs intended sends without emailing.</small></p></div>
 {% endblock %}
