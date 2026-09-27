@@ -580,6 +580,39 @@ def campaign_toggle_lead(cid):
     return redirect(url_for("campaign", cid=cid))
 
 
+@app.route("/campaign/<int:cid>/leads/delete", methods=["POST"])
+def campaign_delete_leads(cid):
+    """Delete selected leads (by id) from a campaign.
+
+    Only leads belonging to this user's campaign are touched. Each
+    deleted lead also loses its unsent queue items and cached AI
+    drafts, so no orphans remain. Send history (send_log) is kept.
+    """
+    r = require_login()
+    if r:
+        return r
+    if not _own_campaign(cid):
+        return "Campaign not found", 404
+    user_id = uid()
+    ids = []
+    for x in request.form.getlist("lead_id"):
+        try:
+            ids.append(int(x))
+        except (TypeError, ValueError):
+            continue
+    if ids:
+        placeholders = ",".join("?" for _ in ids)
+        owned = [row["id"] for row in db.q(
+            f"SELECT id FROM leads WHERE campaign_id=? AND user_id=? AND id IN ({placeholders})",
+            (cid, user_id, *ids))]
+        if owned:
+            ph = ",".join("?" for _ in owned)
+            db.w(f"DELETE FROM send_queue WHERE lead_id IN ({ph}) AND status='pending'", owned)
+            db.w(f"DELETE FROM ai_content WHERE lead_id IN ({ph})", owned)
+            db.w(f"DELETE FROM leads WHERE id IN ({ph}) AND user_id=?", (*owned, user_id))
+    return redirect(url_for("campaign", cid=cid))
+
+
 @app.route("/campaign/<int:cid>/validate", methods=["POST"])
 def campaign_validate(cid):
     r = require_login()

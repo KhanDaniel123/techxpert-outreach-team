@@ -1387,11 +1387,33 @@ check("berlin queries: german district query",
 check("berlin queries: deduplicated",
       len(qs) == len(set(q.lower() for q in qs)))
 check("berlin queries: meaningful rotation size", len(qs) >= 20, str(len(qs)))
+# localized queries must come first for non-English locations: the
+# scheduler rotates one query per tick, and English queries for German
+# locations mostly return aggregators that get filtered out
+en_idx = next(i for i, q in enumerate(qs) if "Gyms and fitness centers" in q)
+check("german-first: translated base queries lead the rotation",
+      all("Fitnessstudio" in q or "Fitnesscenter" in q for q in qs[:3]),
+      str(qs[:3]))
+check("german-first: translated district queries before english base",
+      all("Fitnessstudio" in q or "Fitnesscenter" in q for q in qs[3:en_idx])
+      and en_idx == 15, str(en_idx))
+check("german-first: exact order blocks",
+      qs[0] == "Fitnessstudios und Fitnesscenter Berlin, Germany"
+      and qs[3] == "Fitnessstudios und Fitnesscenter Mitte Berlin"
+      and qs[15] == "Gyms and fitness centers Berlin, Germany"
+      and qs[18] == "Gyms and fitness centers Mitte Berlin")
+check("german-first: rotation starts on a german query",
+      "Fitnessstudio" in pipelinemod.pick_query(qs, {})[0]
+      or "Fitnesscenter" in pipelinemod.pick_query(qs, {})[0])
 
 us = pipelinemod.build_discovery_queries("HVAC contractor", "Phoenix AZ")
 check("non-german location: no german queries",
       not any("Fitnessstudio" in q or "Fitnesscenter" in q for q in us))
 check("unknown city: plain location queries only", len(us) == 3, str(us))
+check("english location keeps english-first order",
+      us == ["HVAC contractor Phoenix AZ",
+             "HVAC contractor in Phoenix AZ",
+             "Phoenix AZ HVAC contractor"], str(us))
 check("empty niche/location -> no queries",
       pipelinemod.build_discovery_queries("", "Berlin") == []
       and pipelinemod.build_discovery_queries("gym", "") == [])
@@ -1622,7 +1644,74 @@ check("campaign followups gone",
 check("campaign ai cache gone",
       db.q("SELECT COUNT(*) c FROM ai_content WHERE lead_id=?", (lid,), one=True)["c"] == 0)
 
-# ================= 16. self-serve connection tests =================
+# ================= 16. delete selected leads =================
+u_dl = make_user("del-leads@example.com")
+c_dl = login_client("del-leads@example.com")
+cid_dl = make_campaign(c_dl, name="Lead Delete Camp")
+lid1 = add_lead(cid_dl, u_dl["id"], "one@example.com", "One Biz")
+lid2 = add_lead(cid_dl, u_dl["id"], "two@example.com", "Two Biz")
+lid3 = add_lead(cid_dl, u_dl["id"], "three@example.com", "Three Biz")
+# unsent queue items + cached AI drafts for the two doomed leads
+db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at) VALUES (?,?, 'pending', 0)",
+     (cid_dl, lid1))
+db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at) VALUES (?,?, 'pending', 0)",
+     (cid_dl, lid2))
+db.w("INSERT INTO ai_content (lead_id, subject, body, created_at) VALUES (?,?,?,?)",
+     (lid1, "s", "b", time.time()))
+db.w("INSERT INTO ai_content (lead_id, subject, body, created_at) VALUES (?,?,?,?)",
+     (lid2, "s", "b", time.time()))
+# a terminal queue row for the kept lead must be left alone
+db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at) VALUES (?,?, 'sent', 0)",
+     (cid_dl, lid3))
+
+r = c_dl.post(f"/campaign/{cid_dl}/leads/delete",
+              data={"lead_id": [str(lid1), str(lid2), "not-an-int"]},
+              follow_redirects=False)
+check("delete selected leads redirects", r.status_code == 302)
+check("deleted leads gone",
+      db.q("SELECT id FROM leads WHERE id=?", (lid1,), one=True) is None
+      and db.q("SELECT id FROM leads WHERE id=?", (lid2,), one=True) is None)
+check("unselected lead kept",
+      db.q("SELECT id FROM leads WHERE id=?", (lid3,), one=True) is not None)
+check("unsent queue items of deleted leads gone",
+      db.q("SELECT COUNT(*) c FROM send_queue WHERE lead_id IN (?,?)",
+           (lid1, lid2), one=True)["c"] == 0)
+check("ai drafts of deleted leads gone",
+      db.q("SELECT COUNT(*) c FROM ai_content WHERE lead_id IN (?,?)",
+           (lid1, lid2), one=True)["c"] == 0)
+check("kept lead's queue row untouched",
+      db.q("SELECT COUNT(*) c FROM send_queue WHERE lead_id=?",
+           (lid3,), one=True)["c"] == 1)
+# deleting with no ids selected is a harmless no-op
+n_before = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+                (cid_dl,), one=True)["c"]
+r = c_dl.post(f"/campaign/{cid_dl}/leads/delete", data={}, follow_redirects=False)
+check("delete with no ids keeps everything",
+      r.status_code == 302
+      and db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+               (cid_dl,), one=True)["c"] == n_before)
+
+# cross-user: cannot delete another user's leads
+u_dl2 = make_user("del-leads2@example.com")
+c_dl2 = login_client("del-leads2@example.com")
+cid_dl2 = make_campaign(c_dl2, name="Other Lead Camp")
+lid_other = add_lead(cid_dl2, u_dl2["id"], "other@example.com", "Other Biz")
+r = c_dl2.post(f"/campaign/{cid_dl}/leads/delete", data={"lead_id": [str(lid3)]})
+check("cannot delete leads via another user's campaign id", r.status_code == 404)
+r = c_dl.post(f"/campaign/{cid_dl}/leads/delete", data={"lead_id": [str(lid_other)]},
+              follow_redirects=False)
+check("another user's lead id through own campaign deletes nothing",
+      r.status_code == 302
+      and db.q("SELECT id FROM leads WHERE id=?", (lid_other,), one=True) is not None)
+
+# button present in the campaign leads section
+r = c_dl.get(f"/campaign/{cid_dl}")
+check("campaign page has Delete selected button",
+      r.status_code == 200 and b"Delete selected" in r.data
+      and f"/campaign/{cid_dl}/leads/delete".encode() in r.data
+      and b"confirmDeleteLeads" in r.data)
+
+# ================= 17. self-serve connection tests =================
 import smtplib as _smtplib_test
 import config as configmod
 import ai_writer as aiwmod

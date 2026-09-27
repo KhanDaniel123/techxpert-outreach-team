@@ -113,27 +113,34 @@ def _translate_niche(niche, lang):
 def build_discovery_queries(niche, location):
     """Ordered, deduplicated search queries for one campaign.
 
-    English base queries first, then German-language variants when the
-    location is in Germany, then one query per district for mapped cities.
-    Pure function: easy to test, no DB.
+    For non-English locations (e.g. Berlin, Germany) the localized
+    queries come first: translated base templates, then translated
+    district queries, then the English base templates, then the
+    English district queries. The scheduler rotates one query per
+    tick, and for German locations the English queries mostly return
+    aggregators/listicles that get filtered out (0 new leads), so the
+    German queries must hit first. English locations keep the plain
+    English order. Pure function: easy to test, no DB.
     """
     niche = (niche or "").strip()
     location = (location or "").strip()
     if not niche or not location:
         return []
-    queries = [t.format(n=niche, loc=location) for t in BASE_QUERY_TEMPLATES]
     lang = _location_lang(location)
     translated = ""
     if lang != "en":
         translated = _translate_niche(niche, lang)
-        if translated.lower() != niche.lower():
-            queries += [t.format(n=translated, loc=location)
-                        for t in BASE_QUERY_TEMPLATES]
+        if translated.lower() == niche.lower():
+            translated = ""
+    en_base = [t.format(n=niche, loc=location) for t in BASE_QUERY_TEMPLATES]
+    de_base = ([t.format(n=translated, loc=location) for t in BASE_QUERY_TEMPLATES]
+               if translated else [])
     city = location.split(",")[0].strip()
-    for district in LOCATION_DISTRICTS.get(city.lower(), ()):
-        queries.append(f"{niche} {district} {city}")
-        if translated and translated.lower() != niche.lower():
-            queries.append(f"{translated} {district} {city}")
+    districts = LOCATION_DISTRICTS.get(city.lower(), ())
+    en_dist = [f"{niche} {district} {city}" for district in districts]
+    de_dist = ([f"{translated} {district} {city}" for district in districts]
+               if translated else [])
+    queries = (de_base + de_dist + en_base + en_dist) if translated else (en_base + en_dist)
     seen, out = set(), []
     for q in queries:
         if q.lower() not in seen:

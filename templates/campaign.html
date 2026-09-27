@@ -45,7 +45,26 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <form method="post" action="/campaign/{{ campaign.id }}/enrich"><button class="ghost" type="submit">Run enrichment (find emails)</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/validate"><button class="ghost" type="submit" title="Re-run email validation on selected leads">Validate emails</button></form>
 {% if ai_on and campaign.autopilot %}<form method="post" action="/campaign/{{ campaign.id }}/autopilot"><button class="ghost" type="submit" title="Write a personal AI email for each selected lead">Write AI emails</button></form>{% endif %}
+<form id="del-leads-form" method="post" action="/campaign/{{ campaign.id }}/leads/delete" onsubmit="return confirmDeleteLeads()"><button class="ghost" type="submit" title="Delete the checked leads, their queued (unsent) sends and their cached AI drafts">Delete selected</button></form>
 </div>
+<script>
+function confirmDeleteLeads() {
+  var ids = [];
+  document.querySelectorAll('form[action$="/toggle_lead"] input[type="checkbox"]:checked').forEach(function (cb) {
+    var hid = cb.form.querySelector('input[name="lead_id"]');
+    if (hid && hid.value) ids.push(hid.value);
+  });
+  if (!ids.length) { alert("Tick the checkbox on the lead rows you want to delete first."); return false; }
+  if (!confirm("Delete " + ids.length + " selected lead(s)? Their queued (unsent) sends and cached AI drafts will be deleted too. This cannot be undone.")) return false;
+  var form = document.getElementById("del-leads-form");
+  ids.forEach(function (id) {
+    var inp = document.createElement("input");
+    inp.type = "hidden"; inp.name = "lead_id"; inp.value = id;
+    form.appendChild(inp);
+  });
+  return true;
+}
+</script>
 {% if job %}<p><small>Last job [{{ job.kind }}]: <span class="pill {{ 'ok' if job.status=='done' else ('bad' if job.status=='failed' else 'mut') }}">{{ job.status }}</span> {{ job.done }}/{{ job.total }} {{ job.result }}</small>
 {% if job.status=='running' %} <button class="ghost" onclick="location.reload()">Refresh</button>{% endif %}</p>
 <p><small>Jobs run in chunks on each scheduler tick (<span class="mono">/api/process-queue</span>). Hit "Process queue now" on the dashboard, or wait for the cron.</small></p>{% endif %}
