@@ -61,7 +61,7 @@ DISCOVER_PER_TICK = 30   # new leads inserted per tick (across all query variant
 OSM_GROUPS_PER_TICK = 3  # Overpass tag groups per tick, sequential, never parallel
 WEB_QUERIES_PER_TICK = 2  # web-search queries per tick
 DISCOVER_TIME_BUDGET_S = 25  # stop starting new discovery queries past this
-ENRICH_PER_TICK = 3     # websites crawled for emails per tick
+ENRICH_PER_TICK = 8      # websites crawled for emails per tick
 DM_PER_TICK = 2         # businesses searched for decision makers per tick
                         # (each does site fetches + one grounded AI call)
 DM_VALIDATE_PER_TICK = 5  # decision-maker emails validated per tick
@@ -200,7 +200,7 @@ AGGREGATOR_DOMAINS = (
     # real Berlin shakedown run): review aggregator, city directory,
     # listicle site, gym comparison portal.
     "werkenntdenbesten.de", "citiesinsider.com", "besteberlin.com",
-    "gymfind.de",
+    "gymfind.de", "unilocal.de", "cylex.de",
 )
 
 # Brands matched as a domain part (catches country TLDs like
@@ -241,6 +241,10 @@ LISTICLE_PATTERNS = (
     r"\bbeste[nsr]?\b.{0,60}\bin\b", # "Beste Fitnessstudios in Berlin"
     r"\bim vergleich\b",             # "59 Studios im Vergleich"
     r"\bvergleich\b",                # "Vergleich" (comparison)
+    r"\bdie\s+besten\b",             # "Die Besten der Stadt",
+                                     # "... Die besten Fitnessstudios von Günstig bis Premium"
+    r"\b\d+\s*x\s+in\b",             # "EVO Fitness 3x in Berlin: ..." (listicle title)
+    r"\bpreise\s+und\s+bewertungen\b",  # "... Öffnungszeiten, Preise und Bewertungen"
 )
 LISTICLE_RES = tuple(re.compile(p, re.I) for p in LISTICLE_PATTERNS)
 
@@ -533,10 +537,12 @@ def _discover(camp):
     Daily throttle: the cursor tracks disc_date/disc_today (new leads
     inserted today, dedup-aware). Once the campaign's daily_discovery_target
     is hit, discovery pauses until the next day and the pipeline moves on
-    to enrich today's batch. The existing overall pipeline_target_leads
-    ceiling still applies. After enough consecutive ticks with zero new
-    leads (a full query rotation with nothing new), discovery is exhausted
-    and the pipeline moves on. Returns next stage or None (stay).
+    to enrich today's batch. The old lifetime pipeline_target_leads ceiling
+    no longer gates discovery: it is kept in the DB/UI as an informational
+    goal only, so the daily loop never stalls permanently. After enough
+    consecutive ticks with zero new leads (a full query rotation with
+    nothing new), discovery is exhausted and the pipeline moves on.
+    Returns next stage or None (stay).
     """
     cid = camp["id"]
     niche = (camp.get("niche") or "").strip()
@@ -549,10 +555,7 @@ def _discover(camp):
         cur["disc_date"] = today
         cur["disc_today"] = 0
         _save_cursor(cid, cur)
-    total_target = camp.get("pipeline_target_leads") or 50
     daily_target = _daily_target(camp)
-    if _lead_count(cid) >= total_target:
-        return "enrich"
     if int(cur.get("disc_today") or 0) >= daily_target:
         # Daily target hit: pause discovery until tomorrow; today's batch
         # moves on to enrichment.
@@ -573,7 +576,7 @@ def _discover(camp):
         # unproductive ticks means discovery is exhausted: move on.
         cur["empty"] = int(cur.get("empty", 0) or 0) + 1
     _save_cursor(cid, cur)
-    if _lead_count(cid) >= total_target or cur["disc_today"] >= daily_target:
+    if cur["disc_today"] >= daily_target:
         return "enrich"
     if cur["empty"] >= len(build_discovery_queries(niche, location)):
         cur["empty"] = 0
@@ -594,7 +597,7 @@ def _enrich(camp):
         (cid, ENRICH_PER_TICK))
     if not rows:
         return "validate"
-    results = enrichmod.enrich_leads(rows, pause=0.8)
+    results = enrichmod.enrich_leads(rows, pause=0.5)
     niche = (camp.get("niche") or "").strip()
     by_id = {r["id"]: r for r in rows}
     import crm as _crm
@@ -829,13 +832,13 @@ def _queue(camp):
 
 
 def _purge_junk(camp):
-    """Retroactive junk purge, at most once per day per campaign.
+    """Retroactive junk purge, run on every scheduler tick.
 
     The junk/listicle/aggregator filter only screens at discovery time, so
     leads that entered before a filter improvement (e.g. old listicle or
-    TripAdvisor rows) sit in the DB forever. This re-runs the CURRENT
-    `discovery_verdict` over every lead that has never been contacted and
-    deletes the ones that now fail.
+    directory rows) sit in the DB until this re-screens them. It runs every
+    tick because discovery_verdict is cheap regex and new junk can arrive
+    at any time; only never-contacted leads are eligible.
 
     Never touched, no matter what the filter says:
       - any row in send_log (sent, dry-run, bounced, failed: all history)
@@ -848,10 +851,6 @@ def _purge_junk(camp):
     Every deletion is logged. Returns the number of leads purged.
     """
     cid = camp["id"]
-    cur = _cursor(camp)
-    today = _today_str()
-    if cur.get("purge_date") == today:
-        return 0
     niche = (camp.get("niche") or "").strip()
     location = (camp.get("location") or "").strip()
     rows = db.q(
@@ -875,8 +874,6 @@ def _purge_junk(camp):
         purged += 1
         log.info("purge: deleted junk lead %r (%s): %s",
                  r["business_name"], site or "(no website)", reason)
-    cur["purge_date"] = today
-    _save_cursor(cid, cur)
     if purged:
         log.info("purge: campaign %s (%s) removed %d junk leads",
                  cid, camp.get("name"), purged)

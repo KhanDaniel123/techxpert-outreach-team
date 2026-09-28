@@ -8,7 +8,7 @@
 <form method="post" action="/campaign/{{ campaign.id }}/pipeline_save"><div class="row">
 <div><label><small>Niche</small></label><input name="niche" value="{{ campaign.niche }}" placeholder="HVAC contractor"></div>
 <div><label><small>Location</small></label><input name="location" value="{{ campaign.location }}" placeholder="Phoenix AZ"></div>
-<div><label><small>Target leads</small></label><input type="number" name="pipeline_target_leads" min="5" max="500" value="{{ campaign.pipeline_target_leads or 50 }}"></div>
+<div><label><small title="Informational goal only; the daily New leads/day target governs discovery">Lead goal (info only)</small></label><input type="number" name="pipeline_target_leads" min="5" max="500" value="{{ campaign.pipeline_target_leads or 50 }}"></div>
 <div><label><small>New leads/day</small></label><input type="number" name="daily_discovery_target" min="10" max="1000" value="{{ campaign.daily_discovery_target or 100 }}" title="Discovery pauses each day after this many NEW leads, then resumes tomorrow"></div>
 <div><label><small>Max decision makers/business</small></label><input type="number" name="dm_max_contacts" min="1" max="4" value="{{ campaign.dm_max_contacts or 3 }}" title="How many verified decision makers to find and email per business (1-4)"></div>
 <div style="align-self:end"><label title="Find verified decision makers for each business and email them individually"><input type="checkbox" name="dm_enabled" {{ 'checked' if campaign.dm_enabled is none or campaign.dm_enabled }} style="width:auto"> <small>Decision makers</small></label></div>

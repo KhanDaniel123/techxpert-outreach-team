@@ -2456,12 +2456,11 @@ check("queued junk lead never purged", lid_queued in gone)
 check("replied junk lead never purged", lid_replied in gone)
 check("unsubscribed junk lead kept as record", lid_unsub in gone)
 check("nameless lead skipped", lid_noname in gone)
-# once per day: second run is a no-op
-check("purge runs at most once per day",
-      pipelinemod._purge_junk(db.q("SELECT * FROM campaigns WHERE id=?", (cidP,), one=True)) == 0)
-curP = json.loads(db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?", (cidP,), one=True)["pipeline_cursor"])
-check("purge stamps purge_date",
-      curP.get("purge_date") == _dt.now().strftime("%Y-%m-%d"))
+# every tick: a second run right after the first also purges newly arrived junk
+lid_newjunk = _purg_lead("88 Top Gyms", "https://88top.example")
+check("purge runs on consecutive ticks",
+      pipelinemod._purge_junk(db.q("SELECT * FROM campaigns WHERE id=?", (cidP,), one=True)) == 1
+      and db.q("SELECT id FROM leads WHERE id=?", (lid_newjunk,), one=True) is None)
 # newly discovered junk is still blocked at insert time
 before = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cidP,), one=True)["c"]
 ok = pipelinemod._try_insert_lead(campP2, "66 Top Gyms", "https://66top.example",
@@ -2477,6 +2476,50 @@ s = pipelinemod.tick_all()
 check("tick_all purges junk leads",
       s.get("purged", 0) >= 1
       and db.q("SELECT id FROM leads WHERE id=?", (lid_tick,), one=True) is None)
+
+
+# ================= 21. Pipeline surgical fixes (volume + filters) =================
+print("\n--- 21. Pipeline surgical fixes ---")
+
+# 21a. German listicle titles from the production shakedown are dropped.
+for _junk in ["Die Besten der Stadt",
+              "Prenzlauer Berg: Die besten Fitnessstudios von Günstig bis Premium",
+              "EVO Fitness 3x in Berlin: Standorte und Angebot",
+              "FITONE Berlin-Schöneberg: Öffnungszeiten, Preise und Bewertungen"]:
+    _keep, _why = pipelinemod.discovery_verdict(
+        _junk, "https://junk.example/x", "gyms", "Berlin, Germany")
+    check(f"junk title dropped: {_junk[:45]}", not _keep, _why)
+
+# 21b. German directory domains are treated as aggregators.
+for _dom in ["https://www.unilocal.de/berlin/fitness",
+             "https://web2.cylex.de/fitbox-berlin"]:
+    _keep, _why = pipelinemod.discovery_verdict(
+        "Some Gym", _dom, "gyms", "Berlin, Germany")
+    check(f"aggregator domain dropped: {_dom}", not _keep, _why)
+
+# 21c. Real Berlin gym names survive the new patterns.
+for _real, _url in [("Kieser Training", "https://kieser-training.example"),
+                    ("McFit", "https://mcfit.example"),
+                    ("Fitbox", "https://fitbox.example")]:
+    _keep, _why = pipelinemod.discovery_verdict(
+        _real, _url, "gyms", "Berlin, Germany")
+    check(f"real business kept: {_real}", _keep, _why)
+
+# 21d. Enrichment throughput raised for volume.
+check("enrich per-tick is 8", pipelinemod.ENRICH_PER_TICK == 8)
+
+# 21e. _discover ignores the (now informational) lifetime goal once exceeded:
+# 3 seeded leads with pipeline_target_leads=2, daily target untouched.
+cid21e = _vol_campaign(daily=100, target=2)
+for _nm, _ws in [("Kieser Training", "https://kieser-training.example"),
+                 ("McFit", "https://mcfit.example"),
+                 ("Fitbox", "https://fitbox.example")]:
+    add_lead(cid21e, uV["id"], "", name=_nm)
+_stage21e = _run_discover_tick(cid21e, _fake_links2)
+check("discover ignores lifetime goal once exceeded",
+      _stage21e == "discover"
+      and db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+               (cid21e,), one=True)["c"] == 7)
 
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
