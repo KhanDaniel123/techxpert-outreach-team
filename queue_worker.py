@@ -348,6 +348,39 @@ def process_all(send_fn=None):
             "processed_at": datetime.now().isoformat(timespec="seconds")}
 
 
+def _pipeline_diagnostics(cid):
+    """Read-only snapshot explaining why a campaign did or did not send:
+    lead counts, email verdict breakdown, and how many leads are queueable
+    right now."""
+    import lead_quality as lqmod
+    total = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?",
+                 (cid,), one=True)["c"]
+    with_email = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND email<>''",
+                      (cid,), one=True)["c"]
+    verdicts = {r["v"]: r["c"] for r in db.q(
+        "SELECT COALESCE(NULLIF(email_verdict,''),'(none)') v, COUNT(*) c "
+        "FROM leads WHERE campaign_id=? AND email<>'' GROUP BY v", (cid,))}
+    queueable = db.q(
+        ("SELECT COUNT(*) c FROM leads l WHERE l.campaign_id=? AND l.selected=1 "
+         "AND l.email<>'' AND l.email_verdict IN " + lqmod.queueable_verdict_sql() +
+         " AND l.replied=0 AND l.unsubscribed=0 "
+         "AND NOT EXISTS (SELECT 1 FROM send_queue q "
+         "WHERE q.campaign_id=l.campaign_id AND q.lead_id=l.id) "
+         "AND NOT EXISTS (SELECT 1 FROM send_log s "
+         "WHERE s.campaign_id=l.campaign_id AND s.lead_id=l.id "
+         "AND s.status IN ('sent','dry-run')) "
+         "AND NOT EXISTS (SELECT 1 FROM send_log b "
+         "WHERE b.campaign_id=l.campaign_id AND b.lead_id=l.id "
+         "AND b.status='bounced')"),
+        (cid,), one=True)["c"]
+    qp = db.q("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=? AND status='pending'",
+              (cid,), one=True)["c"]
+    sent = db.q("SELECT COUNT(*) c FROM send_log WHERE campaign_id=? AND status='sent'",
+                (cid,), one=True)["c"]
+    return {"leads": total, "with_email": with_email, "verdicts": verdicts,
+            "queueable_now": queueable, "queue_pending": qp, "sent_total": sent}
+
+
 def process_pipeline_full(time_budget_s=50, send_fn=None):
     """Manual "run to sends": advance pipeline stages repeatedly (plus due
     sends after each round) until every pipeline-enabled campaign reaches
@@ -385,6 +418,15 @@ def process_pipeline_full(time_budget_s=50, send_fn=None):
             break
         if stages and all(s["stage"] == "done" for s in stages.values()) and not sends:
             break
+    camp_ids = [c["id"] for c in
+                db.q("SELECT id FROM campaigns WHERE pipeline_enabled=1 ORDER BY id")]
+    diagnostics = {}
+    for cid in camp_ids:
+        try:
+            diagnostics[cid] = _pipeline_diagnostics(cid)
+        except Exception as e:
+            diagnostics[cid] = {"error": str(e)[:150]}
     return {"rounds": rounds, "stages": stages, "sends": all_sends,
             "elapsed_s": round(time.time() - start, 1), "budget_hit": budget_hit,
+            "diagnostics": diagnostics,
             "processed_at": datetime.now().isoformat(timespec="seconds")}

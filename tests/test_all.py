@@ -1284,6 +1284,20 @@ with mock.patch.object(queue_worker, "process_pipeline_full",
 check("/api/process-full runs full pipeline (login)",
       r.status_code == 200 and b"rounds" in r.data)
 
+# --- process_pipeline_full diagnostics explain a no-send run ---
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='done' WHERE id=?",
+     (campP,))
+with mock.patch.object(pipelinemod, "tick_campaign",
+                       side_effect=lambda camp: ("done", "")), \
+     mock.patch.object(queue_worker, "process_sends", return_value=[]):
+    res3 = queue_worker.process_pipeline_full(time_budget_s=10)
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+diag = res3["diagnostics"][campP]
+check("process_pipeline_full reports diagnostics",
+      res3["rounds"] >= 1 and isinstance(diag.get("leads"), int)
+      and isinstance(diag.get("verdicts"), dict)
+      and isinstance(diag.get("queueable_now"), int))
+
 # no residual Google OAuth references
 import subprocess
 g = subprocess.run(["grep", "-rn", "--exclude-dir=tests",
