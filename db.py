@@ -79,6 +79,16 @@ sender_accounts = Table("sender_accounts", metadata,
                         Column("last_account_note", Text, default=""),
                         Column("created_at", Float, nullable=False))
 
+# Password-reset tokens: single-use, 1-hour expiry, stored hashed.
+password_resets = Table("password_resets", metadata,
+                        Column("id", Integer, primary_key=True, autoincrement=True),
+                        Column("user_id", Integer, nullable=False),
+                        Column("email", Text, nullable=False, default=""),
+                        Column("token_hash", Text, nullable=False, unique=True),
+                        Column("created_at", Float, nullable=False),
+                        Column("expires_at", Float, nullable=False),
+                        Column("used_at", Float, nullable=True))
+
 campaigns = Table("campaigns", metadata,
                   Column("id", Integer, primary_key=True, autoincrement=True),
                   Column("user_id", Integer, nullable=False),
@@ -104,6 +114,9 @@ campaigns = Table("campaigns", metadata,
                   # write/queue/done; cursor holds small JSON resume state.
                   Column("pipeline_enabled", Integer, nullable=False, server_default="0"),
                   Column("pipeline_target_leads", Integer, nullable=False, server_default="50"),
+                  # Daily discovery throttle for the continuous growth loop:
+                  # discovery pauses each day after this many NEW leads.
+                  Column("daily_discovery_target", Integer, nullable=False, server_default="100"),
                   Column("pipeline_stage", Text, default=""),
                   Column("pipeline_cursor", Text, default=""),
                   Column("created_at", Float, nullable=False))
@@ -256,6 +269,7 @@ def _migrate():
                       "max_touches INTEGER DEFAULT 7",
                       "pipeline_enabled INTEGER DEFAULT 0",
                       "pipeline_target_leads INTEGER DEFAULT 50",
+                      "daily_discovery_target INTEGER DEFAULT 100",
                       "pipeline_stage TEXT DEFAULT ''",
                       "pipeline_cursor TEXT DEFAULT ''"],
         "send_queue": ["step INTEGER DEFAULT 0"],
@@ -274,6 +288,8 @@ def _migrate():
     _ensure_notifications_table()
     _ensure_ai_content_table()
     _ensure_user_settings_table()
+    _ensure_password_resets_table()
+    _ensure_app_users_email_unique()
 
 
 def _ensure_notifications_table():
@@ -333,6 +349,70 @@ def _ensure_user_settings_table():
             con.execute(text(ddl))
     except Exception:
         pass
+
+
+def _ensure_password_resets_table():
+    """Idempotent CREATE TABLE for password-reset tokens (covers databases
+    that predate the table; create_all() covers fresh DBs)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS password_resets ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "user_id INTEGER NOT NULL, email TEXT DEFAULT '', "
+               "token_hash TEXT NOT NULL UNIQUE, "
+               "created_at FLOAT NOT NULL, expires_at FLOAT NOT NULL, "
+               "used_at FLOAT)")
+        if IS_POSTGRES:
+            ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                              "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
+
+
+def _ensure_app_users_email_unique():
+    """Add a UNIQUE constraint on app_users.email for databases whose table
+    predates the constraint (fresh DBs already get it via create_all()).
+
+    Never deletes data: while duplicate email rows exist (legacy), the
+    constraint is skipped and app-level checks block new duplicates.
+    Retried on every boot, so it lands automatically once dupes are gone.
+    Returns True when the constraint was added by this call.
+    """
+    try:
+        dupes = q("SELECT email FROM app_users GROUP BY email "
+                  "HAVING COUNT(*) > 1 LIMIT 1")
+        if dupes:
+            return False
+        if IS_POSTGRES:
+            has = q("""SELECT 1 FROM information_schema.table_constraints tc
+                       JOIN information_schema.key_column_usage kcu
+                         ON tc.constraint_name = kcu.constraint_name
+                        AND tc.table_schema = kcu.table_schema
+                       WHERE tc.table_name = 'app_users'
+                         AND tc.constraint_type = 'UNIQUE'
+                         AND kcu.column_name = 'email' LIMIT 1""")
+            if has:
+                return False
+            from sqlalchemy import text
+            with engine.begin() as con:
+                con.execute(text("ALTER TABLE app_users "
+                                 "ADD CONSTRAINT app_users_email_unique UNIQUE (email)"))
+            return True
+        # SQLite: look for an existing unique index covering email.
+        for ix in q("PRAGMA index_list(app_users)") or []:
+            if ix.get("unique"):
+                cols = q("PRAGMA index_info(%s)" % ix["name"])
+                if cols and cols[0].get("name") == "email":
+                    return False
+        from sqlalchemy import text
+        with engine.begin() as con:
+            con.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS "
+                             "app_users_email_uidx ON app_users(email)"))
+        return True
+    except Exception:
+        return False
 
 
 def _add_column(table, ddl):
@@ -412,6 +492,11 @@ def get_user(uid):
 
 def get_user_by_email(email):
     return q("SELECT * FROM app_users WHERE email=?", (email,), one=True)
+
+
+def get_users_by_email(email):
+    """All accounts sharing one email, oldest first (legacy duplicates)."""
+    return q("SELECT * FROM app_users WHERE email=? ORDER BY id", (email,))
 
 
 def create_user(email, name, password_hash):

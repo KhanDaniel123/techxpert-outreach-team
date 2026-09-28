@@ -96,6 +96,39 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.route("/forgot-password", methods=["GET", "POST"])
+def forgot_password():
+    if uid():
+        return redirect(url_for("dashboard"))
+    message = None
+    error = None
+    if request.method == "POST":
+        ok, msg = authmod.request_password_reset(request.form.get("email", ""))
+        if ok:
+            message = msg
+        else:
+            error = msg
+    return render_template("forgot_password.html", user=None,
+                           message=message, error=error)
+
+
+@app.route("/reset-password/<token>", methods=["GET", "POST"])
+def reset_password(token):
+    if uid():
+        return redirect(url_for("dashboard"))
+    error = None
+    if request.method == "POST":
+        ok, msg = authmod.redeem_password_reset(token,
+                                                request.form.get("password", ""))
+        if ok:
+            return render_template("message.html", title="Password updated",
+                                   message=msg + " You can now log in.",
+                                   back=url_for("login"), user=None)
+        error = msg
+    return render_template("reset_password.html", user=None,
+                           error=error, token=token)
+
+
 @app.route("/")
 def index():
     return redirect(url_for("dashboard") if uid() else url_for("login"))
@@ -670,11 +703,16 @@ def campaign_pipeline_save(cid):
     except ValueError:
         target = 50
     target = max(5, min(500, target))
-    db.w("UPDATE campaigns SET niche=?, location=?, pipeline_target_leads=? "
-         "WHERE id=? AND user_id=?",
+    try:
+        daily = int(request.form.get("daily_discovery_target", 100) or 100)
+    except ValueError:
+        daily = 100
+    daily = max(10, min(1000, daily))
+    db.w("UPDATE campaigns SET niche=?, location=?, pipeline_target_leads=?, "
+         "daily_discovery_target=? WHERE id=? AND user_id=?",
          (request.form.get("niche", "").strip()[:120],
           request.form.get("location", "").strip()[:120],
-          target, cid, uid()))
+          target, daily, cid, uid()))
     return redirect(url_for("campaign", cid=cid))
 
 

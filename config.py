@@ -19,6 +19,11 @@ Optional:
                       its OpenAI-compatible endpoint instead. Free from Google
                       AI Studio. If both keys are set, Gemini is preferred.
     GEMINI_MODEL    - overrides the default Gemini model name.
+    SYSTEM_SMTP_EMAIL / SYSTEM_SMTP_PASSWORD
+                    - optional Gmail address + App Password used as a fallback
+                      sender for password-reset emails when the user has no
+                      connected sender account of their own. Without it, reset
+                      emails go out from the user's own sender account.
 
 There is deliberately NO Google OAuth here. Login is built-in
 email + password (auth.py); sending is direct Gmail SMTP with per-user
@@ -47,6 +52,12 @@ AI_PRICE_OUT_PER_M = 0.60  # USD per million output tokens (approx)
 # free tier covers this app's volume, so cost is reported as zero.
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() \
     or "gemini-2.0-flash"
+
+# Optional system sender for password-reset emails: a Gmail address + App
+# Password used when the resetting user has no connected sender account of
+# their own. Without these, reset emails go out from the user's own account.
+SYSTEM_SMTP_EMAIL = os.environ.get("SYSTEM_SMTP_EMAIL", "").strip()
+SYSTEM_SMTP_PASSWORD = os.environ.get("SYSTEM_SMTP_PASSWORD", "").strip()
 
 # Compliance footer defaults for cold email (CAN-SPAM style: company name +
 # physical address + one-click unsubscribe). Per-user values set on the

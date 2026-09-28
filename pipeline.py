@@ -10,9 +10,15 @@ ticks. Each tick advances ONE stage for each pipeline-enabled campaign:
              then rotating localized web-search queries built from niche +
              location (local-language variants, e.g. German for Germany,
              French for France, plus district-by-district queries for
-             mapped cities) until the target lead count is reached (a few
-             new businesses per tick). OSM failures never stall the
-             pipeline: web search covers them.
+             mapped cities). Each tick runs several query variants
+             (a few OSM tag groups, then web queries) until the per-tick
+             cap is hit, so a campaign discovers dozens of new leads per
+             tick. Discovery pauses each day once the campaign's
+             daily_discovery_target new leads are in, and resumes the next
+             day: a finished pipeline ("done") goes back to "discover" at
+             the start of a new day, so fresh leads keep flowing in a
+             continuous growth loop while sending continues through the
+             normal queue with all the usual guards.
   enrich   : visit lead websites and extract publicly listed emails.
              Leads with no public email are marked and skipped, never
              retried, never mailed.
@@ -26,15 +32,18 @@ ticks. Each tick advances ONE stage for each pipeline-enabled campaign:
              all the usual guards: reply stops the sequence, a bounce
              stops the sequence, caps and windows are respected.
 
-Per-tick limits are small on purpose (never more than ~10 leads per
-stage per tick) so a serverless tick stays fast and nothing hammers
-anyone. Never guesses emails: only publicly found, validated addresses
-enter the send queue.
+Per-tick limits: discovery is the volume stage (dozens of new leads per
+tick across several query variants); the later stages are sized so a full
+100-lead daily batch clears within a day of 15-minute ticks
+(enrich 3/tick -> ~290/day, validate 10/tick -> ~960/day,
+write 3/tick -> ~290/day, queue 25/tick). Never guesses emails: only
+publicly found, validated addresses enter the send queue.
 """
 import json
 import logging
 import re
 import time
+from datetime import datetime
 
 import db
 import geo
@@ -42,12 +51,17 @@ import lead_quality as lq
 
 log = logging.getLogger(__name__)
 
-DISCOVER_PER_TICK = 8   # new business domains identified per tick
+DISCOVER_PER_TICK = 30   # new leads inserted per tick (across all query variants)
+OSM_GROUPS_PER_TICK = 3  # Overpass tag groups per tick, sequential, never parallel
+WEB_QUERIES_PER_TICK = 2  # web-search queries per tick
+DISCOVER_TIME_BUDGET_S = 25  # stop starting new discovery queries past this
 ENRICH_PER_TICK = 3     # websites crawled for emails per tick
 VALIDATE_PER_TICK = 10  # emails validated per tick (concurrent probes)
-WRITE_PER_TICK = 1      # AI emails written per tick (slow: site fetch + AI)
+WRITE_PER_TICK = 3      # AI emails written per tick (slow: site fetch + AI)
 QUEUE_PER_TICK = 25     # queue inserts are cheap DB writes
 TICK_BUDGET_S = 35      # stop advancing campaigns past this per tick
+
+DAILY_DISCOVERY_DEFAULT = 100  # new leads per day per campaign when unset
 
 STAGES = ("discover", "enrich", "validate", "write", "queue", "done")
 
@@ -287,6 +301,18 @@ def log_skipped(url, name, reason):
              url, (name or "")[:60], reason)
 
 
+def _today_str():
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _daily_target(camp):
+    """New leads per day for this campaign (default 100)."""
+    try:
+        return max(1, int(camp.get("daily_discovery_target") or DAILY_DISCOVERY_DEFAULT))
+    except (TypeError, ValueError):
+        return DAILY_DISCOVERY_DEFAULT
+
+
 def _cursor(camp):
     try:
         return json.loads(camp.get("pipeline_cursor") or "{}")
@@ -310,19 +336,62 @@ def _lead_count(cid):
 
 # ---------------- discover ----------------
 
-def _discover_osm(camp, niche, location):
-    """One OSM tag-group per tick (real, mapped businesses, no API key).
+def _try_insert_lead(camp, name, site, address, phone, niche, notes,
+                     source, allow_no_url=False):
+    """Junk-filter, dedup, then insert one discovery lead.
 
-    Returns the number of new leads added. 0 means OSM is exhausted,
-    unmapped for this niche, or failed this tick -> the caller falls
-    through to web search. OSM failures never stall the campaign.
+    Returns True only when a NEW lead row was inserted (dedup-aware:
+    duplicates merge into the existing row and junk is dropped, both
+    returning False). Used by both the OSM and web discovery paths so the
+    daily counter only counts genuinely new leads.
+    """
+    cid = camp["id"]
+    location = camp.get("location") or ""
+    keep, reason = discovery_verdict(name, site, niche, location,
+                                     allow_no_url=allow_no_url)
+    if not keep:
+        log_skipped(site or "(no website)", name, reason)
+        return False
+    dup = lq.find_duplicate_lead(cid, name, site)
+    if dup:
+        # Same business found twice (e.g. "McFIT Berlin Mitte" vs
+        # "mcfit berlin mitte gmbh"): merge new fields into the existing
+        # row instead of creating a duplicate lead.
+        if lq.merge_lead_fields(dup["id"], name=name, address=address,
+                                phone=phone, website=site):
+            log.info("discovery merged into lead %s: %s", dup["id"], name)
+        return False
+    db.w(
+        """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
+           website, email, rating, review_count, category, source, notes, fit, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (camp["user_id"], cid, name, address or "", phone or "",
+         site, "", "", "", niche, source, notes,
+         lq.detect_fit(name, niche), time.time()))
+    return True
+
+
+def _discover_osm(camp, niche, location, cur, budget, deadline):
+    """Up to OSM_GROUPS_PER_TICK tag groups this tick (real, mapped
+    businesses, no API key). Overpass calls are sequential with a 1s
+    politeness gap between them, never parallel; each call has a timeout
+    plus one retry. Returns the number of NEW leads inserted (stops at
+    `budget` or `deadline`). 0 means OSM is exhausted, unmapped for this
+    niche, or failed this tick -> the caller still runs web search.
+    OSM failures never stall the campaign.
     Research: docs/discovery-research.md.
     """
     import osm_discovery as osm
     cid = camp["id"]
-    cur = _cursor(camp)
     ostate = cur.get("osm") or {}
     if ostate.get("exhausted"):
+        return 0
+    if osm.niche_tag_groups(niche) is None:
+        # Researched as unmapped in OSM (e.g. trades): skip the geocode
+        # entirely, web search covers this niche.
+        ostate["exhausted"] = True
+        cur["osm"] = ostate
+        _save_cursor(cid, cur)
         return 0
     lat, lon = ostate.get("lat"), ostate.get("lon")
     if lat is None or lon is None:
@@ -335,84 +404,50 @@ def _discover_osm(camp, niche, location):
             log.warning("osm: geocoding failed for %r; web search covers this tick", location)
             return 0
         ostate["lat"], ostate["lon"] = lat, lon
-    try:
-        leads, nxt, exhausted = osm.discover(
-            niche, location, lat=lat, lon=lon, group_index=int(ostate.get("gi") or 0))
-    except Exception as e:
-        log.warning("osm discover failed: %s", str(e)[:120])
-        return 0
-    ostate["gi"] = nxt
-    if exhausted:
-        ostate["exhausted"] = True
+        cur["osm"] = ostate
+        _save_cursor(cid, cur)
+    added = 0
+    for g in range(OSM_GROUPS_PER_TICK):
+        if added >= budget or time.time() > deadline:
+            break
+        if g:
+            time.sleep(1.0)  # OSM fair-use: politeness gap between calls
+        try:
+            leads, nxt, exhausted = osm.discover(
+                niche, location, lat=lat, lon=lon,
+                group_index=int(ostate.get("gi") or 0))
+        except Exception as e:
+            log.warning("osm discover failed: %s", str(e)[:120])
+            break
+        ostate["gi"] = nxt
+        if exhausted:
+            ostate["exhausted"] = True
+        for lead in leads:
+            if added >= budget:
+                break
+            name = (lead.get("business_name") or "").strip()
+            site = (lead.get("website") or "").strip()
+            if _try_insert_lead(camp, name, site, lead.get("address", ""),
+                                lead.get("phone", ""), niche,
+                                lead.get("notes", "osm discovery"), "osm",
+                                allow_no_url=True):
+                added += 1
+        if exhausted:
+            break
     cur["osm"] = ostate
     _save_cursor(cid, cur)
-    added = 0
-    for lead in leads[:DISCOVER_PER_TICK]:
-        name = (lead.get("business_name") or "").strip()
-        site = (lead.get("website") or "").strip()
-        keep, reason = discovery_verdict(name, site, niche, location, allow_no_url=True)
-        if not keep:
-            log_skipped(site or "(osm, no website)", name, reason)
-            continue
-        dup = lq.find_duplicate_lead(cid, name, site)
-        if dup:
-            if lq.merge_lead_fields(dup["id"], name=name, address=lead.get("address", ""),
-                                    phone=lead.get("phone", ""), website=site):
-                log.info("osm merged into lead %s: %s", dup["id"], name)
-            continue
-        db.w(
-            """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
-               website, email, rating, review_count, category, source, notes, fit, created_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (camp["user_id"], cid, name, lead.get("address", ""), lead.get("phone", ""),
-             site, "", "", "", niche, "osm", lead.get("notes", "osm discovery"),
-             lq.detect_fit(name, niche), time.time()))
-        added += 1
     return added
 
 
-def _discover(camp):
-    """Add new leads: OSM first, web search second, one step per tick.
-
-    Each tick tries one OSM tag-group (real mapped businesses); when that
-    yields new leads the tick ends. When OSM yields nothing, is exhausted,
-    is unmapped for the niche, or errors, the tick falls through to the
-    rotated localized web-search query. The rotation index is persisted in
-    the campaign cursor. After a full rotation with zero new leads,
-    discovery is exhausted and the pipeline moves on. Returns next stage
-    or None (stay in discover).
+def _discover_web(camp, niche, location, cur, queries, budget, deadline):
+    """Up to WEB_QUERIES_PER_TICK rotated localized web-search queries this
+    tick. Returns the number of NEW leads inserted (stops at `budget` or
+    `deadline`). The rotation index ("q") and the consecutive-empty-tick
+    counter ("empty") persist in the campaign cursor.
     """
     from scrapers import websearch
     from urllib.parse import urlparse
     cid = camp["id"]
-    niche = (camp.get("niche") or "").strip()
-    location = (camp.get("location") or "").strip()
-    if not niche or not location:
-        return None  # misconfigured; wait for the user to fill niche/location
-    target = camp.get("pipeline_target_leads") or 50
-    if _lead_count(cid) >= target:
-        return "enrich"
-    if _discover_osm(camp, niche, location):
-        if _lead_count(cid) >= target:
-            return "enrich"
-        return None
-    queries = build_discovery_queries(niche, location)
-    if not queries:
-        return None
-    cur = _cursor(camp)
-    query, cur["q"] = pick_query(queries, cur)
-    log.info("discovery tick: campaign %s query %d/%d: %r",
-             cid, (cur["q"] - 1) % len(queries) + 1, len(queries), query)
-    try:
-        links = websearch.ddg_links(query)
-    except Exception:
-        links = []
-    if not links:
-        try:
-            time.sleep(5)
-            links = websearch.ddg_links(query)
-        except Exception:
-            links = []
     existing = db.q("SELECT website FROM leads WHERE campaign_id=?", (cid,))
     seen_domains = set()
     for r in existing:
@@ -420,72 +455,115 @@ def _discover(camp):
             seen_domains.add(urlparse(r["website"] or "").netloc.lower())
         except Exception:
             pass
-    new_urls = []
-    for u in links:
-        try:
-            dom = urlparse(u).netloc.lower()
-        except Exception:
-            continue
-        if not dom or dom in seen_domains or dom in [d for d, _ in new_urls]:
-            continue
-        if is_aggregator_domain(dom):
-            log_skipped(u, "", f"aggregator/directory/social domain ({dom})")
-            seen_domains.add(dom)
-            continue
-        new_urls.append((dom, u))
-    if not new_urls:
-        # Nothing new from this angle. A full rotation with zero new leads
-        # means discovery is exhausted: move on with what we have.
-        cur["empty"] = int(cur.get("empty", 0) or 0) + 1
-        _save_cursor(cid, cur)
-        if cur["empty"] >= len(queries):
-            cur["empty"] = 0
-            _save_cursor(cid, cur)
-            return "enrich"
-        return None
-    cur["empty"] = 0
-    _save_cursor(cid, cur)
     added = 0
-    for dom, url in new_urls[:DISCOVER_PER_TICK]:
+    for _ in range(WEB_QUERIES_PER_TICK):
+        if added >= budget or time.time() > deadline:
+            break
+        query, cur["q"] = pick_query(queries, cur)
+        log.info("discovery tick: campaign %s query %d/%d: %r",
+                 cid, (cur["q"] - 1) % len(queries) + 1, len(queries), query)
         try:
-            ident = websearch._site_identity(url)
+            links = websearch.ddg_links(query)
         except Exception:
-            ident = {}
-        name = ((ident or {}).get("name") or "").strip()
-        if name and websearch.ARTICLE_TITLE_RE.search(name):
-            log_skipped(url, name, "article/ranking title (ARTICLE_TITLE_RE)")
+            links = []
+        if not links:
+            try:
+                time.sleep(5)
+                links = websearch.ddg_links(query)
+            except Exception:
+                links = []
+        new_urls = []
+        for u in links:
+            try:
+                dom = urlparse(u).netloc.lower()
+            except Exception:
+                continue
+            if not dom or dom in seen_domains or dom in [d for d, _ in new_urls]:
+                continue
+            if is_aggregator_domain(dom):
+                log_skipped(u, "", f"aggregator/directory/social domain ({dom})")
+                seen_domains.add(dom)
+                continue
+            new_urls.append((dom, u))
+        had_new = False
+        for dom, url in new_urls:
+            if added >= budget or time.time() > deadline:
+                break
+            try:
+                ident = websearch._site_identity(url)
+            except Exception:
+                ident = {}
+            name = ((ident or {}).get("name") or "").strip()
+            if name and websearch.ARTICLE_TITLE_RE.search(name):
+                log_skipped(url, name, "article/ranking title (ARTICLE_TITLE_RE)")
+                seen_domains.add(dom)
+                continue
+            if not name:
+                name = dom.replace("www.", "")
+            site = f"{urlparse(url).scheme}://{dom}"
+            if _try_insert_lead(camp, name, site,
+                                (ident or {}).get("address", ""),
+                                (ident or {}).get("phone", ""), niche,
+                                f"pipeline discovery: {query}", "pipeline"):
+                added += 1
+                had_new = True
             seen_domains.add(dom)
-            continue
-        keep, reason = discovery_verdict(name, url, niche, location)
-        if not keep:
-            log_skipped(url, name, reason)
-            seen_domains.add(dom)
-            continue
-        if not name:
-            name = dom.replace("www.", "")
-        site = f"{urlparse(url).scheme}://{dom}"
-        address = (ident or {}).get("address", "")
-        phone = (ident or {}).get("phone", "")
-        dup = lq.find_duplicate_lead(cid, name, site)
-        if dup:
-            # Same business found twice (e.g. "McFIT Berlin Mitte" vs
-            # "mcfit berlin mitte gmbh"): merge new fields into the existing
-            # row instead of creating a duplicate lead.
-            if lq.merge_lead_fields(dup["id"], name=name, address=address,
-                                    phone=phone, website=site):
-                log.info("discovery merged duplicate: %s into lead %s",
-                         site, dup["id"])
-        else:
-            db.w(
-                """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
-                   website, email, rating, review_count, category, source, notes, fit, created_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (camp["user_id"], cid, name, address, phone, site, "", "", "",
-                 niche, "pipeline", f"pipeline discovery: {query}",
-                 lq.detect_fit(name, niche), time.time()))
-            added += 1
-        seen_domains.add(dom)
-    if _lead_count(cid) >= target:
+        _save_cursor(cid, cur)
+    return added
+
+
+def _discover(camp):
+    """Add new leads: OSM tag groups first, then web-search queries, several
+    query variants per tick until DISCOVER_PER_TICK new leads are in.
+
+    Daily throttle: the cursor tracks disc_date/disc_today (new leads
+    inserted today, dedup-aware). Once the campaign's daily_discovery_target
+    is hit, discovery pauses until the next day and the pipeline moves on
+    to enrich today's batch. The existing overall pipeline_target_leads
+    ceiling still applies. After enough consecutive ticks with zero new
+    leads (a full query rotation with nothing new), discovery is exhausted
+    and the pipeline moves on. Returns next stage or None (stay).
+    """
+    cid = camp["id"]
+    niche = (camp.get("niche") or "").strip()
+    location = (camp.get("location") or "").strip()
+    if not niche or not location:
+        return None  # misconfigured; wait for the user to fill niche/location
+    cur = _cursor(camp)
+    today = _today_str()
+    if cur.get("disc_date") != today:
+        cur["disc_date"] = today
+        cur["disc_today"] = 0
+        _save_cursor(cid, cur)
+    total_target = camp.get("pipeline_target_leads") or 50
+    daily_target = _daily_target(camp)
+    if _lead_count(cid) >= total_target:
+        return "enrich"
+    if int(cur.get("disc_today") or 0) >= daily_target:
+        # Daily target hit: pause discovery until tomorrow; today's batch
+        # moves on to enrichment.
+        return "enrich"
+    deadline = time.time() + DISCOVER_TIME_BUDGET_S
+    budget = DISCOVER_PER_TICK
+    added = _discover_osm(camp, niche, location, cur, budget, deadline)
+    if added < budget and time.time() < deadline:
+        queries = build_discovery_queries(niche, location)
+        if queries:
+            added += _discover_web(camp, niche, location, cur, queries,
+                                   budget - added, deadline)
+    cur["disc_today"] = int(cur.get("disc_today") or 0) + added
+    if added:
+        cur["empty"] = 0
+    else:
+        # Nothing new this tick. A full rotation's worth of consecutive
+        # unproductive ticks means discovery is exhausted: move on.
+        cur["empty"] = int(cur.get("empty", 0) or 0) + 1
+    _save_cursor(cid, cur)
+    if _lead_count(cid) >= total_target or cur["disc_today"] >= daily_target:
+        return "enrich"
+    if cur["empty"] >= len(build_discovery_queries(niche, location)):
+        cur["empty"] = 0
+        _save_cursor(cid, cur)
         return "enrich"
     return None
 
@@ -624,6 +702,60 @@ def _queue(camp):
     return "done"
 
 
+def _purge_junk(camp):
+    """Retroactive junk purge, at most once per day per campaign.
+
+    The junk/listicle/aggregator filter only screens at discovery time, so
+    leads that entered before a filter improvement (e.g. old listicle or
+    TripAdvisor rows) sit in the DB forever. This re-runs the CURRENT
+    `discovery_verdict` over every lead that has never been contacted and
+    deletes the ones that now fail.
+
+    Never touched, no matter what the filter says:
+      - any row in send_log (sent, dry-run, bounced, failed: all history)
+      - any row in send_queue (queued now or ever)
+      - replied = 1
+      - unsubscribed = 1 (compliance records are kept as-is)
+      - empty business name (nothing meaningful to judge; the discovery
+        path never creates those, only manual imports do)
+
+    Every deletion is logged. Returns the number of leads purged.
+    """
+    cid = camp["id"]
+    cur = _cursor(camp)
+    today = _today_str()
+    if cur.get("purge_date") == today:
+        return 0
+    niche = (camp.get("niche") or "").strip()
+    location = (camp.get("location") or "").strip()
+    rows = db.q(
+        """SELECT id, business_name, website, category FROM leads
+           WHERE campaign_id=?
+             AND COALESCE(replied,0)=0 AND COALESCE(unsubscribed,0)=0
+             AND business_name IS NOT NULL AND business_name<>''
+             AND NOT EXISTS (SELECT 1 FROM send_log WHERE lead_id=leads.id)
+             AND NOT EXISTS (SELECT 1 FROM send_queue WHERE lead_id=leads.id)""",
+        (cid,))
+    purged = 0
+    for r in rows:
+        site = (r["website"] or "").strip()
+        keep, reason = discovery_verdict(
+            r["business_name"] or "", site, r["category"] or niche, location,
+            allow_no_url=not site)
+        if keep:
+            continue
+        db.w("DELETE FROM leads WHERE id=?", (r["id"],))
+        purged += 1
+        log.info("purge: deleted junk lead %r (%s): %s",
+                 r["business_name"], site or "(no website)", reason)
+    cur["purge_date"] = today
+    _save_cursor(cid, cur)
+    if purged:
+        log.info("purge: campaign %s (%s) removed %d junk leads",
+                 cid, camp.get("name"), purged)
+    return purged
+
+
 _STAGE_FNS = {
     "discover": _discover,
     "enrich": _enrich,
@@ -637,7 +769,16 @@ def tick_campaign(camp):
     """Advance one pipeline stage for one campaign. Returns (stage, note)."""
     stage = (camp.get("pipeline_stage") or "discover").strip() or "discover"
     if stage == "done":
-        return "done", ""  # terminal: sending/follow-ups continue via normal flow
+        # Daily growth loop: at the start of a new day a finished pipeline
+        # goes back to discover so fresh leads keep flowing in. Same day:
+        # stays done (sending, follow-ups, reply scans continue via the
+        # normal flow).
+        cur = _cursor(camp)
+        if cur.get("disc_date") != _today_str():
+            _set_stage(camp["id"], "discover")
+            stage = "discover"
+        else:
+            return "done", ""  # terminal for today
     if stage not in _STAGE_FNS:
         stage = "discover"
     note = ""
@@ -664,6 +805,13 @@ def tick_all():
         if time.time() - start > TICK_BUDGET_S:
             summary["budget_hit"] = True
             break
+        try:
+            purged = _purge_junk(camp)
+        except Exception as e:
+            log.warning("purge failed for campaign %s: %s", camp["id"], str(e)[:120])
+            purged = 0
+        if purged:
+            summary["purged"] = summary.get("purged", 0) + purged
         stage, note = tick_campaign(camp)
         summary["campaigns"].append(
             {"id": camp["id"], "name": camp["name"], "stage": stage, "note": note})
@@ -687,5 +835,16 @@ def stats(cid):
     replies = one("SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND replied=1", (cid,))
     queued = one("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=? AND status='pending'",
                  (cid,))
+    camp = db.q("SELECT daily_discovery_target, pipeline_cursor FROM campaigns WHERE id=?",
+                (cid,), one=True) or {}
+    cur = {}
+    try:
+        cur = json.loads(camp.get("pipeline_cursor") or "{}")
+    except Exception:
+        pass
+    discovered_today = (int(cur.get("disc_today") or 0)
+                        if cur.get("disc_date") == _today_str() else 0)
     return {"found": found, "emails": emails, "validated": validated,
-            "sent": sent, "replies": replies, "queued": queued}
+            "sent": sent, "replies": replies, "queued": queued,
+            "discovered_today": discovered_today,
+            "daily_target": _daily_target(camp)}

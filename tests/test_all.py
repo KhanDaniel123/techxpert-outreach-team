@@ -1450,10 +1450,11 @@ _keep, _reason = pipelinemod.discovery_verdict(
     "Gyms and fitness centers", "Berlin, Germany")
 check("junk filter still active on aggregator", not _keep)
 
-# per-tick discovery cap raised
-check("discover per-tick cap is 8", pipelinemod.DISCOVER_PER_TICK == 8)
+# per-tick discovery cap raised for volume
+check("discover per-tick cap is 30", pipelinemod.DISCOVER_PER_TICK == 30)
 
 # rotation index persists across ticks via the campaign cursor
+# (two web queries per tick now, so q advances by 2 per tick)
 campQ = make_campaign(ca, "PipeQ", dry_run=1)
 db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
      "pipeline_target_leads=50, pipeline_cursor='{}', niche='HVAC contractor', "
@@ -1469,7 +1470,9 @@ with mock.patch("scrapers.websearch.ddg_links", return_value=[]), \
     cur2 = pipelinemod._cursor(
         db.q("SELECT * FROM campaigns WHERE id=?", (campQ,), one=True))
 check("rotation index persists in cursor",
-      cur1.get("q") == 1 and cur2.get("q") == 2, f"{cur1} {cur2}")
+      cur2.get("q") == (cur1.get("q") + pipelinemod.WEB_QUERIES_PER_TICK)
+      % len(pipelinemod.build_discovery_queries("HVAC contractor", "Phoenix AZ")),
+      f"{cur1} {cur2}")
 
 # ================= 14. Unsubscribe + compliance footer =================
 import unsubscribe as unsubmod
@@ -1937,6 +1940,7 @@ check("enrich persists address, email stays unvalidated, fit independent",
       and lead_e["fit"] == "independent")
 
 # --- discovery flags chains and merges URL variants ---
+import osm_discovery as osmmod
 c_disc = make_campaign(cq, "DiscCamp")
 db.w("UPDATE campaigns SET niche='gyms', location='Berlin', pipeline_stage='discover' WHERE id=?",
      (c_disc,))
@@ -1950,7 +1954,9 @@ def fake_ident(url):
     return {"name": "McFIT Berlin", "phone": "", "address": ""}
 
 
-with mock.patch("scrapers.websearch.ddg_links", side_effect=fake_ddg), \
+with mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)), \
+     mock.patch.object(osmmod, "discover", return_value=([], 0, True)), \
+     mock.patch("scrapers.websearch.ddg_links", side_effect=fake_ddg), \
      mock.patch("scrapers.websearch._site_identity", side_effect=fake_ident), \
      mock.patch.object(pipelinemod, "discovery_verdict", return_value=(True, "ok")):
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (c_disc,), one=True)
@@ -2045,7 +2051,6 @@ check("pipeline _location_lang delegates to geo",
       and pipelinemod._location_lang("Austin TX") == "en")
 
 # ================= 16. osm_discovery =================
-import osm_discovery as osmmod
 
 check("osm tags: gym -> fitness_centre",
       osmmod.niche_tag_groups("gyms") == [("leisure", "fitness_centre")])
@@ -2148,7 +2153,10 @@ with mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)), \
                                        "website": "https://osm-fitness.example",
                                        "source": "osm", "notes": ""}], 1, True)):
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (campO,), one=True)
-    _added = pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany")
+    _osm_cur = pipelinemod._cursor(camp)
+    _added = pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany", _osm_cur,
+                                       pipelinemod.DISCOVER_PER_TICK,
+                                       time.time() + 60)
 _osm_rows = db.q("SELECT business_name, website, source FROM leads WHERE campaign_id=?",
                  (campO,))
 check("osm: no-website lead kept, listicle dropped",
@@ -2190,11 +2198,13 @@ db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='discover', "
      "pipeline_target_leads=50, pipeline_cursor='{}', niche='gyms', "
      "location='Berlin, Germany' WHERE id=?", (campC,))
 _many = [dict(_osm_lead, business_name=f"Fitwerk Mitte {i}",
-              website=f"https://gym{i}.example") for i in range(12)]
+              website=f"https://gym{i}.example") for i in range(40)]
 with mock.patch.object(osmmod, "geocode", return_value=(52.5, 13.4)), \
      mock.patch.object(osmmod, "discover", return_value=(_many, 1, True)):
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (campC,), one=True)
-    pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany")
+    _osm_cur2 = pipelinemod._cursor(camp)
+    pipelinemod._discover_osm(camp, "gyms", "Berlin, Germany", _osm_cur2,
+                              pipelinemod.DISCOVER_PER_TICK, time.time() + 60)
 check("osm: per-tick cap respected",
       db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (campC,), one=True)["c"]
       == pipelinemod.DISCOVER_PER_TICK)
@@ -2225,6 +2235,248 @@ check("footer: openstreetmap attribution rendered",
       r.status_code == 200
       and "OpenStreetMap" in r.data.decode()
       and "openstreetmap.org/copyright" in r.data.decode())
+
+
+# ================= 19. Discovery volume, daily loop, send caps =================
+print("\n--- 19. Discovery volume, daily loop, send caps ---")
+
+import re as _re
+from urllib.parse import urlparse as _urlparse
+from datetime import datetime as _dt, timedelta as _td
+
+uV = make_user("voluser@example.com")
+cV = login_client("voluser@example.com")
+
+def _vol_campaign(niche="gyms", location="Berlin, Germany", daily=100, target=500):
+    cid = make_campaign(cV, "VolCamp-" + niche[:8], dry_run=1)
+    db.w("UPDATE campaigns SET niche=?, location=?, pipeline_target_leads=?, "
+         "daily_discovery_target=? WHERE id=?", (niche, location, target, daily, cid))
+    return cid
+
+def _set_cursor(cid, **kw):
+    row = db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?", (cid,), one=True)
+    try:
+        d = json.loads(row["pipeline_cursor"] or "{}")
+    except Exception:
+        d = {}
+    d.update(kw)
+    db.w("UPDATE campaigns SET pipeline_cursor=? WHERE id=?", (json.dumps(d), cid))
+
+def _get_cursor(cid):
+    row = db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?", (cid,), one=True)
+    try:
+        return json.loads(row["pipeline_cursor"] or "{}")
+    except Exception:
+        return {}
+
+def _fake_ident(url):
+    dom = _urlparse(url).netloc
+    return {"name": dom.split(".")[0].title() + " Co", "phone": "", "address": ""}
+
+def _fake_links2(query):
+    # Long tag: distinct per query text, stable for the same query text
+    # (needed for the deterministic duplicate-tick test).
+    tag = _re.sub(r"\W+", "", query)[:30].lower()
+    return [f"https://{tag}a.example/", f"https://{tag}b.example/"]
+
+def _fake_links_many(query):
+    tag = _re.sub(r"\W+", "", query)[:8].lower()
+    return [f"https://{tag}{i}.example/" for i in range(40)]
+
+def _run_discover_tick(cid, links_fn):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (cid,), one=True)
+    with mock.patch.object(osmmod, "geocode", return_value=(52.52, 13.40)), \
+         mock.patch.object(osmmod, "discover", return_value=([], 0, True)), \
+         mock.patch("scrapers.websearch.ddg_links", side_effect=links_fn), \
+         mock.patch("scrapers.websearch._site_identity", side_effect=_fake_ident):
+        stage, note = pipelinemod.tick_campaign(camp)
+    return stage
+
+# 19a. migration: column exists, defaults to 100 on a fresh campaign
+cols = [c["name"] for c in db.q("PRAGMA table_info(campaigns)")]
+check("daily_discovery_target column exists", "daily_discovery_target" in cols)
+cid19a = make_campaign(cV, "DefCamp", dry_run=1)
+check("default daily target is 100",
+      db.q("SELECT daily_discovery_target FROM campaigns WHERE id=?", (cid19a,), one=True)["daily_discovery_target"] == 100)
+
+# 19b. pipeline form saves + clamps the daily target
+def _save_pipeline(cid, daily):
+    return cV.post(f"/campaign/{cid}/pipeline_save",
+                   data={"niche": "gyms", "location": "Berlin",
+                         "pipeline_target_leads": "50",
+                         "daily_discovery_target": str(daily)})
+_save_pipeline(cid19a, 250)
+check("form stores daily target 250",
+      db.q("SELECT daily_discovery_target FROM campaigns WHERE id=?", (cid19a,), one=True)["daily_discovery_target"] == 250)
+_save_pipeline(cid19a, 5000)
+check("form clamps daily target to 1000",
+      db.q("SELECT daily_discovery_target FROM campaigns WHERE id=?", (cid19a,), one=True)["daily_discovery_target"] == 1000)
+_save_pipeline(cid19a, 3)
+check("form clamps daily target to min 10",
+      db.q("SELECT daily_discovery_target FROM campaigns WHERE id=?", (cid19a,), one=True)["daily_discovery_target"] == 10)
+
+# 19c. several query variants per tick: 2 queries x 2 links -> 4 new leads
+cid19c = _vol_campaign()
+stage = _run_discover_tick(cid19c, _fake_links2)
+check("multi-query tick inserts 4 leads",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cid19c,), one=True)["c"] == 4)
+cur = _get_cursor(cid19c)
+check("query rotation advanced by 2 in one tick", cur.get("q") == 2)
+check("daily counter counts 4", cur.get("disc_today") == 4)
+check("stays in discover while under targets", stage == "discover")
+
+# 19d. per-tick cap: 40 links per query cannot exceed DISCOVER_PER_TICK
+cid19d = _vol_campaign()
+stage = _run_discover_tick(cid19d, _fake_links_many)
+n = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cid19d,), one=True)["c"]
+check("one tick inserts at most DISCOVER_PER_TICK (30)",
+      n == pipelinemod.DISCOVER_PER_TICK)
+check("daily counter equals per-tick cap", _get_cursor(cid19d).get("disc_today") == 30)
+check("stays in discover after cap hit", stage == "discover")
+
+# 19e. dedup-aware counter: re-running the same queries counts nothing new
+_set_cursor(cid19c, q=0)  # rewind rotation so this tick repeats queries 0,1
+stage = _run_discover_tick(cid19c, _fake_links2)
+check("duplicate tick adds no leads",
+      db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cid19c,), one=True)["c"] == 4)
+check("counter ignores duplicates", _get_cursor(cid19c).get("disc_today") == 4)
+check("still discover while queries remain", stage == "discover")
+
+# 19f. daily target pauses discovery at 100 -> stage moves to enrich
+_set_cursor(cid19c, disc_today=99)
+stage = _run_discover_tick(cid19c, _fake_links2)
+cur = _get_cursor(cid19c)
+check("hits daily target then advances to enrich", stage == "enrich")
+check("daily counter recorded 103", cur.get("disc_today") == 103)
+# same-day done loop: a finished pipeline stays done today
+db.w("UPDATE campaigns SET pipeline_stage='done', pipeline_cursor=? WHERE id=?",
+     (json.dumps(cur), cid19c))
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (cid19c,), one=True)
+check("done stays terminal same day",
+      pipelinemod.tick_campaign(camp)[0] == "done")
+
+# 19g. next day: counter resets, discovery resumes, done restarts discover
+yday = (_dt.now() - _td(days=1)).strftime("%Y-%m-%d")
+_set_cursor(cid19c, disc_date=yday, disc_today=101)
+stage = _run_discover_tick(cid19c, _fake_links2)
+cur = _get_cursor(cid19c)
+check("counter resets on a new day", cur.get("disc_today") == 4)
+check("disc_date rolls to today",
+      cur.get("disc_date") == _dt.now().strftime("%Y-%m-%d"))
+check("discovery resumes next day", stage == "discover")
+db.w("UPDATE campaigns SET pipeline_stage='done' WHERE id=?", (cid19c,))
+_set_cursor(cid19c, disc_date=yday)  # yesterday again: done restarts discover
+camp = db.q("SELECT * FROM campaigns WHERE id=?", (cid19c,), one=True)
+stage = _run_discover_tick(cid19c, _fake_links2)
+check("done restarts discover on a new day", stage == "discover")
+
+# 19h. campaign page shows the daily progress pill
+html = cV.get(f"/campaign/{cid19d}").get_data(as_text=True)
+check("page shows today progress (30/100)", "today: 30/100" in html)
+check("page has New leads/day setting", "New leads/day" in html)
+
+# 19i. queue worker stops when the sender account hits its daily cap
+cid19i = make_campaign(cV, "CapCamp", dry_run=0)
+db.w("UPDATE campaigns SET followups_enabled=0 WHERE id=?", (cid19i,))
+acc = add_account(uV["id"], "capsender@gmail.com", daily_cap=2)
+db.w("UPDATE campaigns SET status='sending', next_send_at=0 WHERE id=?", (cid19i,))
+lids = [add_lead(cid19i, uV["id"], f"capbiz{i}@example.com", name=f"CapBiz{i}")
+        for i in range(5)]
+db.w("UPDATE leads SET email_verdict='valid' WHERE campaign_id=?", (cid19i,))
+for lid in lids:
+    db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at, step) "
+         "VALUES (?,?, 'pending', ?, 0)", (cid19i, lid, time.time() - 1))
+sent_cap = []
+def _mock_send(a, t, s, b):
+    sent_cap.append(t)
+    return True
+outcomes = queue_worker._process_campaign(
+    db.q("SELECT * FROM campaigns WHERE id=?", (cid19i,), one=True),
+    time.time(), send_fn=_mock_send)
+check("exactly 2 emails sent before cap",
+      db.q("SELECT COUNT(*) c FROM send_log WHERE campaign_id=? AND status='sent'",
+           (cid19i,), one=True)["c"] == 2)
+check("3 items still pending in queue",
+      db.q("SELECT COUNT(*) c FROM send_queue WHERE campaign_id=? AND status='pending'",
+           (cid19i,), one=True)["c"] == 3)
+check("account sent_today is 2",
+      db.q("SELECT sent_today FROM sender_accounts WHERE id=?",
+           (acc,), one=True)["sent_today"] == 2)
+check("worker reported waiting on account cap",
+      any(o.get("action") == "paused_waiting"
+          and "daily cap" in (o.get("detail") or "") for o in outcomes))
+# simulate tomorrow: eligibility resets
+db.w("UPDATE sender_accounts SET sent_date='' WHERE id=?", (acc,))
+_camp19i = db.q("SELECT * FROM campaigns WHERE id=?", (cid19i,), one=True)
+check("eligibility resets on a new day",
+      any(a["id"] == acc for a in sender.eligible_accounts(uV["id"], _camp19i)))
+
+
+# ================= 20. Retroactive junk auto-purge =================
+print("\n--- 20. Retroactive junk auto-purge ---")
+uP = make_user("purgeuser@example.com")
+cP = login_client("purgeuser@example.com")
+cidP = make_campaign(cP, "PurgeCamp", dry_run=1)
+db.w("UPDATE campaigns SET niche=?, location=?, pipeline_enabled=1 WHERE id=?",
+     ("gyms", "Berlin, Germany", cidP))
+
+def _purg_lead(name, website, **kw):
+    return db.w(
+        """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
+           website, email, email_verdict, category, source, notes, selected,
+           replied, unsubscribed, created_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (uP["id"], cidP, name, "", "", website, kw.get("email", ""), "",
+         "gyms", "pipeline", "", 1, kw.get("replied", 0),
+         kw.get("unsubscribed", 0), time.time()))
+
+lid_listicle = _purg_lead("11 Top Locations", "https://11top.example")
+lid_tripadv = _purg_lead("Hotel Berlin", "https://www.tripadvisor.com/Hotel_Review-Berlin")
+lid_ok = _purg_lead("OSM Fitness Mitte", "https://osm-fitness.example")
+lid_contacted = _purg_lead("22 Best Gyms", "https://22best.example")
+lid_queued = _purg_lead("33 Top Spots", "https://33top.example")
+lid_replied = _purg_lead("44 Best Deals", "https://44best.example", replied=1)
+lid_unsub = _purg_lead("55 Top Picks", "https://55top.example", unsubscribed=1)
+lid_noname = _purg_lead("", "https://noname.example")
+# history that must protect a lead from the purge
+db.w("INSERT INTO send_log (user_id, campaign_id, lead_id, recipient, status, sent_at) "
+     "VALUES (?,?,?,?, 'sent', ?)", (uP["id"], cidP, lid_contacted, "c@example.com", time.time()))
+db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at, step) "
+     "VALUES (?,?, 'pending', ?, 0)", (cidP, lid_queued, time.time() - 1))
+
+campP2 = db.q("SELECT * FROM campaigns WHERE id=?", (cidP,), one=True)
+n_purged = pipelinemod._purge_junk(campP2)
+check("purge removes 2 junk leads", n_purged == 2)
+gone = {r["id"] for r in db.q("SELECT id FROM leads WHERE campaign_id=?", (cidP,))}
+check("listicle lead purged", lid_listicle not in gone)
+check("tripadvisor lead purged", lid_tripadv not in gone)
+check("good lead kept", lid_ok in gone)
+check("contacted junk lead never purged", lid_contacted in gone)
+check("queued junk lead never purged", lid_queued in gone)
+check("replied junk lead never purged", lid_replied in gone)
+check("unsubscribed junk lead kept as record", lid_unsub in gone)
+check("nameless lead skipped", lid_noname in gone)
+# once per day: second run is a no-op
+check("purge runs at most once per day",
+      pipelinemod._purge_junk(db.q("SELECT * FROM campaigns WHERE id=?", (cidP,), one=True)) == 0)
+curP = json.loads(db.q("SELECT pipeline_cursor FROM campaigns WHERE id=?", (cidP,), one=True)["pipeline_cursor"])
+check("purge stamps purge_date",
+      curP.get("purge_date") == _dt.now().strftime("%Y-%m-%d"))
+# newly discovered junk is still blocked at insert time
+before = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cidP,), one=True)["c"]
+ok = pipelinemod._try_insert_lead(campP2, "66 Top Gyms", "https://66top.example",
+                                  "", "", "gyms", "test", "pipeline")
+after = db.q("SELECT COUNT(*) c FROM leads WHERE campaign_id=?", (cidP,), one=True)["c"]
+check("new junk blocked at insert", ok is False and after == before)
+# tick_all wires the purge into the scheduler tick (campaign done: no network)
+lid_tick = _purg_lead("77 Top Things", "https://77top.example")
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id<>?", (cidP,))
+db.w("UPDATE campaigns SET pipeline_stage='done', pipeline_cursor=? WHERE id=?",
+     (json.dumps({"disc_date": _dt.now().strftime("%Y-%m-%d")}), cidP))
+s = pipelinemod.tick_all()
+check("tick_all purges junk leads",
+      s.get("purged", 0) >= 1
+      and db.q("SELECT id FROM leads WHERE id=?", (lid_tick,), one=True) is None)
 
 
 print(f"\n{len(passed)} passed, {len(failed)} failed")
