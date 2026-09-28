@@ -596,7 +596,7 @@ def _enrich(camp):
         "AND email='' AND COALESCE(email_verdict,'')='' ORDER BY id LIMIT ?",
         (cid, ENRICH_PER_TICK))
     if not rows:
-        return "validate"
+        return "people"  # decision-maker stage runs next (forwards to validate itself)
     results = enrichmod.enrich_leads(rows, pause=0.5)
     niche = (camp.get("niche") or "").strip()
     by_id = {r["id"]: r for r in rows}

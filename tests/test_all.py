@@ -1118,6 +1118,23 @@ with mock.patch("enrich.enrich_leads",
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
     stage, note = pipelinemod.tick_campaign(camp)
 check("enrich completes without retrying none leads",
+      stage == "people" and "advanced" in note)
+
+# --- people stage (mocked): decision-maker enrichment is wired into the flow ---
+db.w("UPDATE campaigns SET dm_enabled=1 WHERE id=?", (campP,))
+def fake_dm_enrich(lead, campaign=None, max_contacts=3):
+    db.w("UPDATE leads SET dm_status='done' WHERE id=?", (lead["id"],))
+    return "done", 1
+
+
+with mock.patch("decision_makers.enrich_lead", side_effect=fake_dm_enrich):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, _ = pipelinemod.tick_campaign(camp)
+check("people: decision-maker enrichment runs in-flow", stage == "people")
+with mock.patch("decision_makers.enrich_lead", side_effect=fake_dm_enrich):
+    camp = db.q("SELECT * FROM campaigns WHERE id=?", (campP,), one=True)
+    stage, note = pipelinemod.tick_campaign(camp)
+check("people completes, advances to validate",
       stage == "validate" and "advanced" in note)
 
 # --- validate stage (mocked) ---
