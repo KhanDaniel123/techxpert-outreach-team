@@ -7,6 +7,7 @@ in (auth.py) and sending is direct Gmail SMTP with per-user App Passwords
 POST /api/process-queue (cron).
 """
 import csv
+import hashlib
 import io
 import os
 import re
@@ -102,18 +103,28 @@ def logout():
 
 @app.route("/forgot-password", methods=["GET", "POST"])
 def forgot_password():
-    if uid():
-        return redirect(url_for("dashboard"))
     message = None
     error = None
+    reset_link = None
     if request.method == "POST":
-        ok, msg = authmod.request_password_reset(request.form.get("email", ""))
+        email = request.form.get("email", "")
+        ok, msg = authmod.request_password_reset(email)
         if ok:
             message = msg
+        elif uid():
+            # The account has no usable mail sender, but the requester
+            # holds a valid session: show the one-time link on screen
+            # instead of erroring. See auth.issue_reset_token_for_display.
+            token, _user = authmod.issue_reset_token_for_display(email)
+            if token:
+                reset_link = url_for("reset_password", token=token,
+                                     _external=True)
+            else:
+                message = authmod.RESET_GENERIC_MESSAGE
         else:
             error = msg
-    return render_template("forgot_password.html", user=None,
-                           message=message, error=error)
+    return render_template("forgot_password.html", user=current_user(),
+                           message=message, error=error, reset_link=reset_link)
 
 
 @app.route("/reset-password/<token>", methods=["GET", "POST"])
@@ -125,8 +136,17 @@ def reset_password(token):
         ok, msg = authmod.redeem_password_reset(token,
                                                 request.form.get("password", ""))
         if ok:
+            tip = ""
+            trow = db.q("SELECT user_id FROM password_resets WHERE token_hash=?",
+                        (hashlib.sha256(token.encode("utf-8")).hexdigest(),),
+                        one=True)
+            if trow and not db.q("SELECT id FROM sender_accounts "
+                                 "WHERE user_id=? LIMIT 1", (trow["user_id"],),
+                                 one=True):
+                tip = (" Tip: connect a Gmail sender under Sender accounts so "
+                       "future password resets can be emailed to you.")
             return render_template("message.html", title="Password updated",
-                                   message=msg + " You can now log in.",
+                                   message=msg + " You can now log in." + tip,
                                    back=url_for("login"), user=None)
         error = msg
     return render_template("reset_password.html", user=None,

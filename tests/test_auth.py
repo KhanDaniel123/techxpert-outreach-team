@@ -219,6 +219,65 @@ check("post-cleanup login hits original account", u is not None and u["id"] == o
 u = authmod.verify_login("legacy2@example.com", "newpw12345")
 check("post-cleanup login hits data-bearing account", u is not None and u["id"] == new2)
 
+# ---------- 5. forgot-password in-browser fallback (no mail sender) ----------
+ok, fb = authmod.register_user("fallback@example.com", "FB", "password123")
+fbid = fb["id"]  # deliberately NO sender account
+ok, lg = authmod.register_user("loggedin@example.com", "LI", "password123")
+add_sender_account(lg["id"], "li-sender@example.com")
+client2 = appmod.app.test_client()
+with client2.session_transaction() as s:
+    s["user_id"] = lg["id"]
+
+# logged-in + target has no sender -> one-time link rendered on screen
+r = client2.post("/forgot-password", data={"email": "fallback@example.com"})
+m = re.search(r"/reset-password/([A-Za-z0-9_\-]+)", r.data.decode("utf-8", "ignore"))
+check("logged-in + no sender -> link displayed", r.status_code == 200 and m is not None
+      and b"Do not share it" in r.data, f"status={r.status_code}")
+tok2 = m.group(1)
+# the displayed token redeems through the normal route (fresh logged-out client)
+r = client.post("/reset-password/" + tok2, data={"password": "fallbackpw1"})
+check("displayed token redeemable", r.status_code == 200 and b"Password updated" in r.data)
+check("fallback login works with new password",
+      authmod.verify_login("fallback@example.com", "fallbackpw1") is not None)
+check("no-sender tip shown after reset", b"Sender accounts" in r.data)
+ok, msg = authmod.redeem_password_reset(tok2, "anotherpw12")
+check("displayed token single-use", not ok and "already been used" in msg, repr(msg))
+# expiry still enforced on display-issued tokens
+tok3, _u3 = authmod.issue_reset_token_for_display("fallback@example.com")
+db.w("UPDATE password_resets SET expires_at=? WHERE token_hash=?",
+     (time.time() - 10, hashlib.sha256(tok3.encode("utf-8")).hexdigest()))
+ok, msg = authmod.redeem_password_reset(tok3, "validpass12")
+check("displayed token expiry enforced", not ok and "expired" in msg, repr(msg))
+# rate limit applies to the display path too
+ok, rl2 = authmod.register_user("ratelimit2@example.com", "RL2", "password123")
+got = [authmod.issue_reset_token_for_display("ratelimit2@example.com")[0] for _ in range(4)]
+check("display path rate-limited at 3/hour", all(got[:3]) and got[3] is None,
+      repr([bool(g) for g in got]))
+
+# logged-out + no sender -> current error, no link leaked
+r = client.post("/forgot-password", data={"email": "fallback@example.com"})
+check("logged-out + no sender -> mail error, no link",
+      r.status_code == 200 and b"mail sender" in r.data and b"/reset-password/" not in r.data)
+
+# sender exists -> email path even when logged in, never an on-screen link
+ok, se = authmod.register_user("hassender@example.com", "HS", "password123")
+add_sender_account(se["id"], "hs-sender@example.com")
+sent2 = []
+with mock.patch("smtp_mail.send_message", side_effect=lambda *a, **k: sent2.append(a) or True):
+    r = client2.post("/forgot-password", data={"email": "hassender@example.com"})
+check("sender exists -> email path, no on-screen link",
+      r.status_code == 200 and b"If an account exists" in r.data
+      and b"/reset-password/" not in r.data and len(sent2) == 1)
+
+# logged-in + unknown email -> generic message, no link (no existence leak)
+r = client2.post("/forgot-password", data={"email": "no-such-acct-zzz@example.com"})
+check("logged-in + unknown email -> generic, no link",
+      r.status_code == 200 and b"If an account exists" in r.data and b"/reset-password/" not in r.data)
+
+# logged-in GET renders the page instead of redirecting to the dashboard
+r = client2.get("/forgot-password")
+check("logged-in GET renders page", r.status_code == 200 and b"Reset your password" in r.data)
+
 print(f"\n{len(passed)} passed, {len(failed)} failed")
 if failed:
     print("FAILED:", failed)

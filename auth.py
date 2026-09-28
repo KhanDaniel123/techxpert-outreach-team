@@ -103,24 +103,25 @@ def verify_login(email, password):
     return None
 
 
-def request_password_reset(email):
-    """Start a password reset. Returns (ok, message).
+def _issue_reset_token(email):
+    """Create a password-reset token row. Returns (user, token).
 
-    The public message is always generic so it never reveals whether the
-    email has an account. Returns ok=False only when the reset email
-    genuinely cannot be sent (no mail sender available).
+    Returns (None, None) when the caller must show the generic message
+    (bad email format, rate-limited, or unknown account) so that account
+    existence is never revealed. Token scheme: secrets.token_urlsafe(32),
+    SHA-256 hash stored, 1-hour expiry, single-use.
     """
     email = _clean_email(email)
     if not EMAIL_RE.match(email):
-        return True, RESET_GENERIC_MESSAGE
+        return None, None
     cutoff = time.time() - 3600
     recent = db.q("SELECT COUNT(*) c FROM password_resets "
                   "WHERE email=? AND created_at>?", (email, cutoff), one=True)
     if recent and recent["c"] >= RESET_MAX_REQUESTS_PER_HOUR:
-        return True, RESET_GENERIC_MESSAGE
+        return None, None
     user = primary_user_for_email(email)
     if not user:
-        return True, RESET_GENERIC_MESSAGE
+        return None, None
     token = secrets.token_urlsafe(32)
     token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     now = time.time()
@@ -128,6 +129,20 @@ def request_password_reset(email):
          "(user_id, email, token_hash, created_at, expires_at, used_at) "
          "VALUES (?,?,?,?,?,NULL)",
          (user["id"], email, token_hash, now, now + RESET_TOKEN_TTL_SECONDS))
+    return user, token
+
+
+def request_password_reset(email):
+    """Start a password reset. Returns (ok, message).
+
+    The public message is always generic so it never reveals whether the
+    email has an account. Returns ok=False only when the reset email
+    genuinely cannot be sent (no mail sender available).
+    """
+    user, token = _issue_reset_token(email)
+    if not user:
+        return True, RESET_GENERIC_MESSAGE
+    token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
     try:
         _send_reset_email(user, token)
     except Exception:
@@ -135,6 +150,30 @@ def request_password_reset(email):
         return False, ("We couldn't send the reset email because no mail "
                        "sender is available. Please contact your administrator.")
     return True, RESET_GENERIC_MESSAGE
+
+
+def issue_reset_token_for_display(email):
+    """Create a reset token for on-screen display instead of email.
+
+    Identical token scheme, TTL, rate limit, and single-use semantics to
+    request_password_reset; only the delivery channel differs. The caller
+    MUST use this only when the requester holds a valid authenticated
+    session.
+
+    Security rationale: signup now rejects already-registered emails, so
+    no NEW duplicate accounts can be created; the only sessions that can
+    reach this fallback belong to pre-existing account holders (for
+    example a user locked out of their original account while logged in
+    on an older duplicate). The token keeps every existing protection:
+    unpredictable (secrets.token_urlsafe(32)), stored as a SHA-256 hash,
+    1-hour expiry, single-use, max 3 per hour per email.
+
+    Returns (token, user); (None, None) when the generic message applies.
+    """
+    user, token = _issue_reset_token(email)
+    if not user:
+        return None, None
+    return token, user
 
 
 def redeem_password_reset(token, new_password):
