@@ -346,3 +346,45 @@ def process_all(send_fn=None):
     return {"job_chunk": job_id, "pipeline": pipe, "sends": sends,
             "replies_marked": replies,
             "processed_at": datetime.now().isoformat(timespec="seconds")}
+
+
+def process_pipeline_full(time_budget_s=50, send_fn=None):
+    """Manual "run to sends": advance pipeline stages repeatedly (plus due
+    sends after each round) until every pipeline-enabled campaign reaches
+    'done' for today, or the time budget is hit. One dashboard click drives
+    the whole find -> enrich -> validate -> write -> queue -> send chain
+    instead of one stage-chunk per click. Returns a summary dict."""
+    start = time.time()
+    rounds = 0
+    stages = {}
+    all_sends = []
+    budget_hit = False
+    while True:
+        camps = db.q("SELECT id FROM campaigns WHERE pipeline_enabled=1 ORDER BY id")
+        if not camps:
+            break
+        rounds += 1
+        for c in camps:
+            if time.time() - start >= time_budget_s:
+                budget_hit = True
+                break
+            camp = db.q("SELECT * FROM campaigns WHERE id=?", (c["id"],), one=True)
+            try:
+                stage, note = pipeline.tick_campaign(camp)
+            except Exception as e:
+                stage = camp.get("pipeline_stage") or "?"
+                note = f"error: {str(e)[:120]}"
+            stages[c["id"]] = {"stage": stage, "note": note}
+        try:
+            sends = process_sends(send_fn=send_fn)
+        except Exception as e:
+            sends = [{"action": "error", "detail": str(e)[:150]}]
+        all_sends.extend(sends)
+        if budget_hit or time.time() - start >= time_budget_s:
+            budget_hit = True
+            break
+        if stages and all(s["stage"] == "done" for s in stages.values()) and not sends:
+            break
+    return {"rounds": rounds, "stages": stages, "sends": all_sends,
+            "elapsed_s": round(time.time() - start, 1), "budget_hit": budget_hit,
+            "processed_at": datetime.now().isoformat(timespec="seconds")}

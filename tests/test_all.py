@@ -1244,6 +1244,46 @@ db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
 check("process_all includes pipeline tick",
       "pipeline" in res and "campaigns" in res["pipeline"] and spy_tick.called)
 
+# --- process_pipeline_full: loops ticks until done, sends each round ---
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='enrich' WHERE id=?",
+     (campP,))
+tick_calls = {"n": 0}
+def fake_tick(camp):
+    tick_calls["n"] += 1
+    if tick_calls["n"] < 3:
+        return "enrich", ""
+    db.w("UPDATE campaigns SET pipeline_stage='done' WHERE id=?", (camp["id"],))
+    return "done", "advanced to Done"
+with mock.patch.object(pipelinemod, "tick_campaign", side_effect=fake_tick), \
+     mock.patch.object(queue_worker, "process_sends", return_value=[]) as spy_sends:
+    res = queue_worker.process_pipeline_full(time_budget_s=10)
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+check("process_pipeline_full loops ticks to done",
+      res["rounds"] >= 2 and not res["budget_hit"]
+      and res["stages"][campP]["stage"] == "done" and spy_sends.called)
+
+# --- process_pipeline_full respects the time budget ---
+def fake_tick_slow(camp):
+    time.sleep(0.05)
+    return "enrich", ""
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='enrich' WHERE id=?",
+     (campP,))
+with mock.patch.object(pipelinemod, "tick_campaign", side_effect=fake_tick_slow), \
+     mock.patch.object(queue_worker, "process_sends", return_value=[]):
+    res2 = queue_worker.process_pipeline_full(time_budget_s=0.2)
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (campP,))
+check("process_pipeline_full respects time budget",
+      res2["budget_hit"] and res2["elapsed_s"] < 5)
+
+# --- /api/process-full route (login required) ---
+make_user("u10@example.com")
+c10 = login_client("u10@example.com")
+with mock.patch.object(queue_worker, "process_pipeline_full",
+                       return_value={"rounds": 2, "budget_hit": False}):
+    r = c10.post("/api/process-full")
+check("/api/process-full runs full pipeline (login)",
+      r.status_code == 200 and b"rounds" in r.data)
+
 # no residual Google OAuth references
 import subprocess
 g = subprocess.run(["grep", "-rn", "--exclude-dir=tests",

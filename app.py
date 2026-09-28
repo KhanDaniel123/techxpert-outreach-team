@@ -1082,6 +1082,20 @@ def api_process_queue():
         return jsonify({"error": str(e)[:300]}), 500
 
 
+@app.route("/api/process-full", methods=["POST"])
+def api_process_full():
+    """Manual 'run pipeline to sends' (login required, no cron secret).
+    Loops pipeline ticks until done or ~50s budget, processing sends
+    after each round."""
+    r = require_login()
+    if r:
+        return r
+    try:
+        return jsonify(queue_worker.process_pipeline_full())
+    except Exception as e:
+        return jsonify({"error": str(e)[:300]}), 500
+
+
 @app.route("/api/process-now", methods=["POST"])
 def api_process_now():
     """Manual trigger for local dev / debugging (login required, no cron secret)."""
