@@ -22,6 +22,95 @@ BAD_TLDS = {"png", "jpg", "jpeg", "gif", "svg", "webp", "css", "js", "ico", "pdf
 # Contact-ish page guesses, tried in order
 CONTACT_PATHS = ["/contact", "/contact-us", "/about", "/about-us", "/contact.html", "/contacts"]
 
+# Official social platforms: only links the business published about ITSELF
+# count (footer/header social icons). Personal profiles are never stored.
+SOCIAL_DOMAINS = ("linkedin.com", "instagram.com", "facebook.com", "x.com", "twitter.com")
+
+
+def _base_host(netloc):
+    """Map a link host to its canonical social domain, or '' if none."""
+    h = (netloc or "").lower()
+    if h.startswith("www."):
+        h = h[4:]
+    for dom in SOCIAL_DOMAINS:
+        if h == dom or h.endswith("." + dom):
+            return "twitter.com" if dom == "twitter.com" else dom
+    return ""
+
+
+def _extract_social_urls(html):
+    """Official social links published by the business itself.
+
+    Only business page/profile links are kept:
+      - LinkedIn: /company/, /school/, /showcase/ only (never /in/ personal)
+      - Instagram: /<handle> only (never /p/, /reel/, /explore/, /stories/)
+      - Facebook: /<page> only (never /sharer/, /dialog/, /plugins/)
+      - X/Twitter: /<handle> only (never /intent/, /share/, /i/)
+    Share widgets and aggregator junk are rejected. URLs are normalized
+    (query string, fragment, and trailing slash stripped).
+    """
+    out = {"linkedin_url": "", "instagram_url": "", "facebook_url": "", "x_url": ""}
+    if not html:
+        return out
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return out
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href.lower().startswith(("http://", "https://")):
+            continue
+        try:
+            parts = urlparse(href)
+        except Exception:
+            continue
+        dom = _base_host(parts.netloc)
+        if not dom:
+            continue
+        segs = [s for s in (parts.path or "/").split("/") if s]
+        first = segs[0].lower() if segs else ""
+        key, keep = None, False
+        if dom == "linkedin.com":
+            # Business pages only; /in/ and /pub/ are personal profiles.
+            keep = (parts.path or "").lower().startswith(
+                ("/company/", "/school/", "/showcase/"))
+            key = "linkedin_url"
+        elif dom == "instagram.com":
+            keep = len(segs) == 1 and first not in (
+                "p", "reel", "reels", "explore", "stories", "tv", "accounts",
+                "about", "developer", "directory")
+            key = "instagram_url"
+        elif dom == "facebook.com":
+            keep = len(segs) == 1 and first not in (
+                "sharer", "dialog", "plugins", "login", "help", "ads",
+                "business", "pages", "groups", "events", "marketplace",
+                "watch", "gaming", "fundraisers", "places", "hashtag")
+            key = "facebook_url"
+        elif dom in ("x.com", "twitter.com"):
+            keep = len(segs) == 1 and first not in (
+                "intent", "share", "i", "home", "explore", "search",
+                "hashtag", "login", "signup", "settings", "help", "about",
+                "tos", "privacy")
+            key = "x_url"
+        if key and keep and not out[key]:
+            out[key] = href.split("?")[0].split("#")[0].rstrip("/")
+    return out
+
+
+def save_social(lead_id, res):
+    """Persist official social URLs extracted during enrichment onto the lead.
+    Never raises: social links must never break the enrichment pipeline."""
+    soc = (res or {}).get("social") or {}
+    if not any(soc.get(k) for k in ("linkedin_url", "instagram_url", "facebook_url", "x_url")):
+        return
+    try:
+        import db as _db
+        _db.w("UPDATE leads SET linkedin_url=?, instagram_url=?, facebook_url=?, x_url=? WHERE id=?",
+              (soc.get("linkedin_url") or "", soc.get("instagram_url") or "",
+               soc.get("facebook_url") or "", soc.get("x_url") or "", lead_id))
+    except Exception:
+        pass
+
 
 def _clean_url(u):
     u = (u or "").strip()
@@ -101,10 +190,14 @@ def _jsonld_business(html):
 
 def enrich_website(website, pause=1.0):
     """Returns dict: emails, email, has_contact_form, phone, name, address,
-    pages_checked, page_text, error. page_text is the homepage's visible
-    text (truncated), used for chain/franchise signal detection."""
+    pages_checked, page_text, social, error. page_text is the homepage's visible
+    text (truncated), used for chain/franchise signal detection. social holds
+    the business's self-published official social URLs (LinkedIn company page,
+    Instagram, Facebook, X) found in the homepage HTML."""
     result = {"emails": [], "email": "", "has_contact_form": False, "phone": "",
               "name": "", "address": "", "pages_checked": 0, "page_text": "",
+              "social": {"linkedin_url": "", "instagram_url": "",
+                         "facebook_url": "", "x_url": ""},
               "error": ""}
     base = _clean_url(website)
     if not base:
@@ -137,6 +230,9 @@ def enrich_website(website, pause=1.0):
         result["email"] = result["emails"][0] if result["emails"] else ""
         soup = BeautifulSoup(seen_html[0], "html.parser")
         result["has_contact_form"] = _has_contact_form(soup)
+        # Official social links the business published about itself
+        # (footer/header icons). Extracted from the homepage only.
+        result["social"] = _extract_social_urls(seen_html[0])
         # Visible homepage text for chain/franchise signal detection
         # (lead_quality.detect_fit). Scripts/styles stripped, truncated.
         try:

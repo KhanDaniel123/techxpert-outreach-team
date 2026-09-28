@@ -234,7 +234,11 @@ nav a.bell .badge{position:absolute;top:-4px;right:-4px;background:linear-gradie
   *,*::before,*::after{animation:none!important;transition:none!important}
   html{scroll-behavior:auto}
 }
-</style></head><body>
+</style>
+<script>document.documentElement.className+=' mx-pre';</script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/motion.css') }}">
+<script defer src="{{ url_for('static', filename='js/motion.js') }}"></script>
+</head><body>
 <nav><a class="brand" href="/dashboard">TechXpert <b>Outreach</b></a>{% if user %}<a class="nl" href="/dashboard">Dashboard</a><a class="nl" href="/accounts">Sender accounts</a><a class="nl" href="/logs">Send log</a><a class="nl" href="/settings">Settings</a><a class="bell" href="/notifications" title="Notifications">&#128276;{% if unread %}<span class="badge">{{ unread }}</span>{% endif %}</a><span class="who"><span>{{ user.email }}</span><a class="nl" href="/logout">Logout</a></span>{% endif %}</nav>
 {% block b %}{% endblock %}
 <footer style="text-align:center;padding:18px 12px 26px;color:#8b8fa3;font-size:12px">Business data &copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener" style="color:#8b8fa3">OpenStreetMap</a> contributors</footer>

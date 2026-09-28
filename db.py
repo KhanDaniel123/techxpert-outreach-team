@@ -160,6 +160,13 @@ leads = Table("leads", metadata,
               # decision-maker enrichment state: "" (not attempted),
               # "pending" (no AI key or transient failure; retried),
               # "done" (attempted), "skipped" (no website to search).
+              Column("linkedin_url", Text, default=""),
+              Column("instagram_url", Text, default=""),
+              Column("facebook_url", Text, default=""),
+              Column("x_url", Text, default=""),
+              # Official social links the business published about itself
+              # (footer/header icons on its own site). Self-published =
+              # verified by construction; personal profiles are never stored.
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
@@ -332,7 +339,11 @@ def _migrate():
                   "ai_note TEXT DEFAULT ''",
                   "unsubscribed INTEGER DEFAULT 0",
                   "fit TEXT DEFAULT ''",
-                  "dm_status TEXT DEFAULT ''"],
+                  "dm_status TEXT DEFAULT ''",
+                  "linkedin_url TEXT DEFAULT ''",
+                  "instagram_url TEXT DEFAULT ''",
+                  "facebook_url TEXT DEFAULT ''",
+                  "x_url TEXT DEFAULT ''"],
     }
     for table, cols in want.items():
         for ddl in cols:

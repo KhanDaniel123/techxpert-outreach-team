@@ -49,6 +49,7 @@ Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_st
 <form method="post" action="/campaign/{{ campaign.id }}/websearch"><button class="ghost" type="submit">Find leads (web search)</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/enrich"><button class="ghost" type="submit">Run enrichment (find emails)</button></form>
 <form method="post" action="/campaign/{{ campaign.id }}/validate"><button class="ghost" type="submit" title="Re-run email validation on selected leads">Validate emails</button></form>
+<form method="get" action="/campaign/{{ campaign.id }}/export/daily"><button class="ghost" type="submit" title="Download today's discovered leads as CSV (business, socials, decision makers)">Export today's CSV</button></form>
 {% if ai_on and campaign.autopilot %}<form method="post" action="/campaign/{{ campaign.id }}/autopilot"><button class="ghost" type="submit" title="Write a personal AI email for each selected lead">Write AI emails</button></form>{% endif %}
 <form id="del-leads-form" method="post" action="/campaign/{{ campaign.id }}/leads/delete" onsubmit="return confirmDeleteLeads()"><button class="ghost" type="submit" title="Delete the checked leads, their queued (unsent) sends and their cached AI drafts">Delete selected</button></form>
 </div>
@@ -86,7 +87,7 @@ function confirmDeleteLeads() {
 <input type="hidden" name="lead_id" value="{{ l.id }}">
 <input type="checkbox" name="selected" {{ 'checked' if l.selected }} onchange="this.form.submit()" style="width:auto"></form></td>
 <td><a href="/lead/{{ l.id }}">{{ l.business_name }}</a></td><td class="mono">{{ l.phone }}</td>
-<td>{% if l.website %}<a href="{{ l.website }}" target="_blank">site</a>{% endif %}</td>
+<td>{% if l.website %}<a href="{{ l.website }}" target="_blank">site</a>{% endif %}{% if l.linkedin_url %} <a href="{{ l.linkedin_url }}" target="_blank" title="LinkedIn company page (from their own website)">in</a>{% endif %}{% if l.instagram_url %} <a href="{{ l.instagram_url }}" target="_blank" title="Instagram (from their own website)">ig</a>{% endif %}{% if l.facebook_url %} <a href="{{ l.facebook_url }}" target="_blank" title="Facebook (from their own website)">fb</a>{% endif %}{% if l.x_url %} <a href="{{ l.x_url }}" target="_blank" title="X/Twitter (from their own website)">x</a>{% endif %}</td>
 <td class="mono">{{ l.email }}</td>
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
 <td><small>{% if l.email and l.email_verdict=='valid' %}<span class="pill ok">Email verified</span>{% elif l.email and l.email_verdict=='risky' %}<span class="pill mut" title="Catch-all server, the mailbox itself could not be confirmed">Email risky</span>{% elif l.email %}<span class="pill bad">Email not verified</span>{% else %}<span class="pill mut">No email</span>{% endif %}

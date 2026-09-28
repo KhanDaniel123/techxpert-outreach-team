@@ -6,12 +6,15 @@ in (auth.py) and sending is direct Gmail SMTP with per-user App Passwords
 (smtp_mail.py). No background threads: sending and chunked jobs run via
 POST /api/process-queue (cron).
 """
+import csv
 import io
 import os
+import re
 import smtplib
 import time
+from datetime import datetime
 
-from flask import Flask, request, redirect, url_for, session, render_template, jsonify, send_file
+from flask import Flask, request, redirect, url_for, session, render_template, jsonify, send_file, Response
 
 import config
 import db
@@ -521,6 +524,48 @@ def campaign(cid):
                            pipe_stage_label=pipe_stage_label,
                            dm_lead_counts=dm_lead_counts, activity=activity,
                            user=current_user())
+
+
+@app.route("/campaign/<int:cid>/export/daily")
+def campaign_export_daily(cid):
+    """Download today's discovered leads as CSV, for manual LinkedIn/IG outreach.
+
+    Columns: business, website, city/address, discovery date, official social
+    URLs (self-published on the business's own site), verified decision makers
+    (name + title), email + verdict. Only leads discovered today (server date).
+    """
+    r = require_login()
+    if r:
+        return r
+    camp = _own_campaign(cid)
+    if not camp:
+        return "Campaign not found", 404
+    day_start = datetime.now().replace(hour=0, minute=0, second=0,
+                                       microsecond=0).timestamp()
+    rows = db.q("SELECT * FROM leads WHERE campaign_id=? AND created_at>=? ORDER BY id",
+                (cid, day_start))
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["business_name", "website", "city/address", "discovery_date",
+                "linkedin_url", "instagram_url", "facebook_url",
+                "decision_makers", "email", "email_verdict"])
+    for l in rows:
+        dms = [c for c in decisionmakersmod.get_contacts(l["id"]) if c.get("verified")]
+        dm_str = "; ".join(
+            ((c.get("name") or "").strip()
+             + (", " + (c.get("title") or "").strip() if (c.get("title") or "").strip() else ""))
+            for c in dms if (c.get("name") or "").strip())
+        w.writerow([
+            l.get("business_name") or "", l.get("website") or "",
+            l.get("address") or "",
+            datetime.fromtimestamp(l.get("created_at") or 0).strftime("%Y-%m-%d"),
+            l.get("linkedin_url") or "", l.get("instagram_url") or "",
+            l.get("facebook_url") or "", dm_str,
+            l.get("email") or "", l.get("email_verdict") or ""])
+    slug = re.sub(r"[^a-z0-9]+", "-", (camp.get("name") or "campaign").lower()).strip("-") or "campaign"
+    fname = f"{slug}-{datetime.now().strftime('%Y-%m-%d')}.csv"
+    return Response(buf.getvalue(), mimetype="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 
 @app.route("/lead/<int:lid>")

@@ -1,0 +1,117 @@
+/* ==========================================================================
+   TechXpert Outreach - motion layer (progressive enhancement)
+   --------------------------------------------------------------------------
+   Pure CSS + tiny vanilla JS (motion.js). Nothing here changes layout or
+   content; if the stylesheet or script fails to load, the app falls back to
+   the base design untouched. All motion is disabled for users who prefer
+   reduced motion.
+   ========================================================================== */
+
+:root{
+  --mx-ease:cubic-bezier(.22,.9,.28,1);
+}
+
+/* ---- pre-JS: hold entrance animations so the stagger can start cleanly ----
+   motion.js removes .mx-pre on load. If the script never loads, elements
+   stay visible and static: a safe degradation. */
+.mx-pre .card,
+.mx-pre .stat,
+.mx-pre .hero,
+.mx-pre nav{animation:none !important}
+
+/* ---- 1. staggered page-load entrances ------------------------------------
+   motion.js adds .mx-stagger + --mx-d (0..14) to nav, hero, stats and cards
+   in DOM order. Reuses the base `rise` keyframes. */
+.mx-anim .mx-stagger{
+  animation:rise .55s var(--mx-ease) both;
+  animation-delay:calc(var(--mx-d,0)*55ms);
+}
+
+/* ---- 2. animated stat counters -------------------------------------------
+   motion.js counts .stat .n from 0 up. Tabular numerals stop the digits
+   from jittering while they roll. */
+.stat .n{font-variant-numeric:tabular-nums}
+
+/* ---- 3. discovery progress bar -------------------------------------------
+   motion.js injects .mx-pbar after the "today: X/Y" pills on the campaign
+   page and animates the fill. */
+.mx-pbar{margin:12px 0 4px}
+.mx-pbar .mx-track{
+  height:8px;border-radius:99px;overflow:hidden;position:relative;
+  background:rgba(148,178,220,.12);border:1px solid var(--border);
+}
+.mx-pbar .mx-fill{
+  height:100%;width:0;border-radius:99px;position:relative;
+  background:linear-gradient(90deg,#0069d6,#0085ff,#6db9ff);
+  box-shadow:0 0 12px rgba(0,133,255,.55);
+  transition:width 1.2s var(--mx-ease) .3s;
+}
+.mx-pbar .mx-fill::after{
+  content:"";position:absolute;inset:0;
+  background:linear-gradient(100deg,transparent 30%,rgba(255,255,255,.45) 50%,transparent 70%);
+  transform:translateX(-100%);
+  animation:mx-sheen 2.4s ease-in-out infinite;
+}
+.mx-pbar .mx-label{
+  font-size:11.5px;color:var(--muted);margin-top:6px;
+  letter-spacing:.04em;font-weight:600;
+}
+@keyframes mx-sheen{60%,100%{transform:translateX(100%)}}
+
+/* ---- 4. card / button / pill micro-interactions --------------------------- */
+.mx-anim .card{transition:border-color .25s var(--mx-ease),box-shadow .25s var(--mx-ease),transform .25s var(--mx-ease)}
+.mx-anim .card:hover{transform:translateY(-2px)}
+.mx-anim button:active,.mx-anim .btn:active{transform:translateY(1px) scale(.98)}
+.mx-anim .pill{transition:transform .15s var(--mx-ease),border-color .2s var(--mx-ease),box-shadow .2s var(--mx-ease)}
+.mx-anim .pill:active{transform:scale(.93)}
+.mx-anim nav a.nl:active{transform:scale(.95)}
+
+/* bell badge pops in when there are unread notifications */
+.mx-anim nav a.bell .badge{
+  animation:mx-pop .45s var(--mx-ease) both .5s;
+  transform-origin:center;
+}
+@keyframes mx-pop{from{transform:scale(0)}70%{transform:scale(1.25)}to{transform:scale(1)}}
+
+/* ---- 5. shimmer / skeleton utilities --------------------------------------
+   For loading placeholders. Add class="mx-shimmer" (or mx-skel mx-shimmer)
+   to any block that is waiting on content. */
+.mx-shimmer{position:relative;overflow:hidden}
+.mx-shimmer::after{
+  content:"";position:absolute;inset:0;pointer-events:none;
+  background:linear-gradient(100deg,transparent 35%,rgba(169,218,255,.14) 50%,transparent 65%);
+  transform:translateX(-100%);
+  animation:mx-sheen 1.8s ease-in-out infinite;
+}
+.mx-skel{border-radius:8px;background:rgba(148,178,220,.09);min-height:14px}
+
+/* ---- 6. pipeline steps + LIVE pills breathe -------------------------------- */
+.mx-anim .pipe-step.now{animation:mx-steppulse 2s ease-in-out infinite}
+@keyframes mx-steppulse{
+  0%,100%{box-shadow:0 0 16px rgba(0,133,255,.4)}
+  50%{box-shadow:0 0 28px rgba(0,133,255,.8)}
+}
+.mx-anim .pill.live{animation:mx-livepulse 2.6s ease-in-out infinite}
+@keyframes mx-livepulse{
+  0%,100%{box-shadow:0 0 18px rgba(0,133,255,.40)}
+  50%{box-shadow:0 0 28px rgba(0,133,255,.70)}
+}
+
+/* ---- 7. timeline / activity rows reveal on scroll --------------------------
+   motion.js adds .mx-row to the rows and .mx-in via IntersectionObserver.
+   Rows stay fully visible when JS is off or reduced motion is preferred. */
+.mx-anim .mx-row{
+  opacity:0;transform:translateY(10px);
+  transition:opacity .5s var(--mx-ease),transform .5s var(--mx-ease);
+}
+.mx-anim .mx-row.mx-in{opacity:1;transform:none}
+
+/* ---- 8. reduced motion: everything still, everything visible --------------- */
+@media (prefers-reduced-motion:reduce){
+  .mx-pre .card,.mx-pre .stat,.mx-pre .hero,.mx-pre nav{animation:none !important}
+  .mx-anim .mx-stagger{animation:none !important}
+  .mx-anim .mx-row{opacity:1 !important;transform:none !important;transition:none !important}
+  .mx-pbar .mx-fill{transition:none !important}
+  .mx-shimmer::after,.mx-pbar .mx-fill::after{animation:none !important}
+  .mx-anim .pipe-step.now,.mx-anim .pill.live,.mx-anim nav a.bell .badge{animation:none !important}
+}

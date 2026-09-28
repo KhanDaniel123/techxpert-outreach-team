@@ -204,6 +204,8 @@ def _enrich_chunk(job):
         elif res.get("has_contact_form"):
             db.w("UPDATE leads SET has_contact_form=1, notes='contact form, no public email' WHERE id=?",
                  (lid,))
+        # Official social links, saved whether or not an email was found.
+        enrichmod.save_social(lid, res)
     done = db.q("SELECT done FROM jobs WHERE id=?", (job["id"],), one=True)["done"] or 0
     _save(job["id"], done=done + len(rows),
           result=f"{updated} new emails so far")

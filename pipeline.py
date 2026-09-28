@@ -633,6 +633,8 @@ def _enrich(camp):
                            "No public email found"
                            + ("; contact form available" if res["has_contact_form"] else ""),
                            meta={"email": ""})
+        # Official social links, saved whether or not an email was found.
+        enrichmod.save_social(res["lead_id"], res)
     return None
 
 
