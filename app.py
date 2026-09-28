@@ -510,6 +510,8 @@ def campaign(cid):
     dm_lead_counts = decisionmakersmod.lead_dm_counts(cid)
     pipe_stage = (camp.get("pipeline_stage") or "discover").strip() or "discover"
     pipe_stage_label = pipelinemod.STAGE_LABELS.get(pipe_stage, pipe_stage)
+    import crm as _crm
+    activity = _crm.campaign_activity(cid)
     return render_template("campaign.html", campaign=camp, leads=lead_rows,
                            qstat={s["status"]: s["c"] for s in qstat}, job=job,
                            fu_list=fu_list, fu_map=fu_map, fu_count=fu_count,
@@ -517,7 +519,7 @@ def campaign(cid):
                            ai_on=ai_on, ai_cost=ai_cost, ai_written=ai_written,
                            pipe=pipe_stats, pipe_stage=pipe_stage,
                            pipe_stage_label=pipe_stage_label,
-                           dm_lead_counts=dm_lead_counts,
+                           dm_lead_counts=dm_lead_counts, activity=activity,
                            user=current_user())
 
 
@@ -534,8 +536,10 @@ def lead_detail(lid):
     if not camp:
         return "Lead not found", 404
     contacts = decisionmakersmod.get_contacts(lid)
+    import crm as _crm
+    events = _crm.lead_timeline(lid)
     return render_template("lead.html", lead=lead, campaign=camp,
-                           contacts=contacts, user=current_user())
+                           contacts=contacts, events=events, user=current_user())
 
 
 def _lead_seq_status(cid, fu_count):
@@ -660,6 +664,14 @@ def campaign_delete_leads(cid):
             (cid, user_id, *ids))]
         if owned:
             ph = ",".join("?" for _ in owned)
+            import crm as _crm
+            for row in db.q(
+                    f"SELECT id, business_name FROM leads WHERE id IN ({ph}) AND user_id=?",
+                    (*owned, user_id)):
+                _crm.log_event(row["id"], "suppressed",
+                               f"Lead suppressed (deleted) by the user: "
+                               f"{row['business_name'] or 'unnamed lead'}",
+                               meta={"campaign_id": cid})
             db.w(f"DELETE FROM send_queue WHERE lead_id IN ({ph}) AND status='pending'", owned)
             db.w(f"DELETE FROM ai_content WHERE lead_id IN ({ph})", owned)
             db.w(f"DELETE FROM leads WHERE id IN ({ph}) AND user_id=?", (*owned, user_id))

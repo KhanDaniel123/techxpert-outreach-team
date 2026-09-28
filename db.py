@@ -254,6 +254,18 @@ contacts = Table("contacts", metadata,
                  Column("source_url", Text, default=""),
                  Column("verified", Integer, nullable=False, server_default="0"),
                  Column("created_at", Float, nullable=False))
+# CRM timeline: one row per touch on a lead (created, enriched,
+# validated, queued, sent real/dry-run, follow-ups, replies, bounces,
+# unsubscribes, suppression, sequence stops). Written by the action
+# itself, never reconstructed from counters.
+lead_events = Table("lead_events", metadata,
+                    Column("id", Integer, primary_key=True, autoincrement=True),
+                    Column("lead_id", Integer, nullable=False),
+                    Column("contact_id", Integer),
+                    Column("event_type", Text, nullable=False),
+                    Column("detail", Text, default=""),
+                    Column("meta", Text, default="{}"),
+                    Column("created_at", Float, nullable=False))
 # Reply notifications: one row per replied lead per user. created_at is the
 # detection time; read_at is set when the user opens the notifications page.
 notifications = Table("notifications", metadata,
@@ -330,6 +342,8 @@ def _migrate():
     _ensure_user_settings_table()
     _ensure_password_resets_table()
     _ensure_contacts_table()
+    _ensure_lead_events_table()
+    _backfill_lead_created_events()
     _ensure_app_users_email_unique()
 
 
@@ -352,6 +366,40 @@ def _ensure_contacts_table():
                               "SERIAL PRIMARY KEY")
         with engine.begin() as con:
             con.execute(text(ddl))
+    except Exception:
+        pass
+
+
+def _ensure_lead_events_table():
+    """Idempotent CREATE TABLE for the CRM timeline (covers databases that
+    predate the table; create_all() covers fresh DBs)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS lead_events ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "lead_id INTEGER NOT NULL, contact_id INTEGER, "
+               "event_type TEXT NOT NULL, detail TEXT DEFAULT '', "
+               "meta TEXT DEFAULT '{}', created_at FLOAT NOT NULL)")
+        if IS_POSTGRES:
+            ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                              "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
+
+
+def _backfill_lead_created_events():
+    """One honest `lead_created` event per existing lead, dated at the
+    lead's own created_at. Idempotent (skips leads that already have one).
+    No other history is fabricated: the timeline starts at deploy."""
+    try:
+        w("INSERT INTO lead_events (lead_id, contact_id, event_type, detail, meta, created_at) "
+          "SELECT id, NULL, 'lead_created', "
+          "'Lead found: ' || COALESCE(NULLIF(business_name,''), website, 'lead'), "
+          "'{}', created_at FROM leads "
+          "WHERE NOT EXISTS (SELECT 1 FROM lead_events e "
+          "WHERE e.lead_id = leads.id AND e.event_type='lead_created')")
     except Exception:
         pass
 

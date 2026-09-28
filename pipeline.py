@@ -371,13 +371,17 @@ def _try_insert_lead(camp, name, site, address, phone, niche, notes,
                                 phone=phone, website=site):
             log.info("discovery merged into lead %s: %s", dup["id"], name)
         return False
-    db.w(
+    lid = db.w(
         """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
            website, email, rating, review_count, category, source, notes, fit, created_at)
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (camp["user_id"], cid, name, address or "", phone or "",
          site, "", "", "", niche, source, notes,
          lq.detect_fit(name, niche), time.time()))
+    import crm as _crm
+    _crm.log_event(lid, "lead_created",
+                   f"Lead discovered: {name}" + (f" ({site})" if site else ""),
+                   meta={"source": source})
     return True
 
 
@@ -593,8 +597,10 @@ def _enrich(camp):
     results = enrichmod.enrich_leads(rows, pause=0.8)
     niche = (camp.get("niche") or "").strip()
     by_id = {r["id"]: r for r in rows}
+    import crm as _crm
     for res in results:
         lead = by_id.get(res["lead_id"]) or {}
+        pages = res.get("pages_checked") or 0
         # Chain/franchise check, now that the homepage text is available.
         sig = lq.detect_fit(lead.get("business_name", ""), niche,
                             res.get("page_text", ""))
@@ -614,12 +620,19 @@ def _enrich(camp):
                   1 if res["has_contact_form"] else 0,
                   f"pipeline: public email found ({res['pages_checked']} pages)",
                   res["lead_id"]))
+            _crm.log_event(res["lead_id"], "enriched",
+                           f"Public email found: {res['email']} ({pages} pages checked)",
+                           meta={"email": res["email"]})
         else:
             # No public email: listed, skipped silently from here on.
             db.w("""UPDATE leads SET email_verdict='none', has_contact_form=?,
                     address=COALESCE(NULLIF(address,''), ?),
                     notes='pipeline: no public email found' WHERE id=?""",
                  (1 if res["has_contact_form"] else 0, addr, res["lead_id"]))
+            _crm.log_event(res["lead_id"], "enriched",
+                           "No public email found"
+                           + ("; contact form available" if res["has_contact_form"] else ""),
+                           meta={"email": ""})
     return None
 
 
@@ -656,9 +669,16 @@ def _people(camp):
         (cid, DM_PER_TICK))
     if not rows:
         return "validate"
+    import crm as _crm
     for lead in rows:
         try:
-            dmm.enrich_lead(lead, camp, max_contacts=_dm_max(camp))
+            status, added = dmm.enrich_lead(lead, camp, max_contacts=_dm_max(camp))
+            if status == "done":
+                _crm.log_event(
+                    lead["id"], "decision_makers_found",
+                    (f"{added} verified decision maker(s) found"
+                     if added else "Searched; no verifiable decision makers found"),
+                    meta={"added": added})
         except Exception as e:
             log.warning("people stage: lead %s failed: %s", lead["id"], str(e)[:120])
             try:
@@ -680,13 +700,15 @@ def _validate(camp):
         "AND COALESCE(email_verdict,'')='' ORDER BY id LIMIT ?",
         (cid, VALIDATE_PER_TICK))
     crows = db.q(
-        "SELECT c.id, c.email FROM contacts c "
+        "SELECT c.id, c.email, c.lead_id FROM contacts c "
         "WHERE c.email<>'' AND COALESCE(c.email_verdict,'')='' "
         "AND c.lead_id IN (SELECT id FROM leads WHERE campaign_id=?) "
         "ORDER BY c.id LIMIT ?",
         (cid, DM_VALIDATE_PER_TICK))
     if not rows and not crows:
         return "write"
+
+    import crm as _crm
 
     def apply(table, idcol, row, res):
         verdict = res["verdict"]
@@ -704,6 +726,16 @@ def _validate(camp):
             db.w(f"UPDATE {table} SET email_verdict=?, email_verdict_detail=? "
                  f"WHERE {idcol}=?",
                  (verdict, detail[:200], row["id"]))
+        if table == "leads":
+            _crm.log_event(
+                row["id"], "email_validated",
+                f"Email {verdict}: {row['email'] or '(dropped)'} ({detail[:120]})",
+                meta={"verdict": verdict})
+        else:
+            _crm.log_event(
+                row.get("lead_id"), "email_validated",
+                f"Decision-maker email {verdict}: {row['email'] or '(dropped)'} ({detail[:120]})",
+                contact_id=row["id"], meta={"verdict": verdict})
 
     if rows:
         for row, res in zip(rows, validate_emails([r["email"] for r in rows],
@@ -771,6 +803,7 @@ def _queue(camp):
     now = time.time()
     dm_on = _dm_enabled(camp)
     dm_max = _dm_max(camp)
+    import crm as _crm
     for lead in rows:
         contacts = (dmm.mailable_contacts(lead["id"], dm_max) if dm_on else [])
         targets = [c["id"] for c in contacts] or [None]
@@ -778,6 +811,12 @@ def _queue(camp):
             db.w("INSERT INTO send_queue (campaign_id, lead_id, contact_id, status, scheduled_at, step)"
                  " VALUES (?,?,?, 'pending', ?, 0)",
                  (cid, lead["id"], contact_id, now))
+        if camp.get("dry_run"):
+            who = (f"{len(contacts)} decision maker(s)" if contacts
+                   else "the general email")
+            _crm.log_event(lead["id"], "dry_run_queued",
+                           f"Queued for sending to {who} (dry-run mode: no real emails go out)",
+                           meta={"contacts": len(contacts)})
     if rows:
         db.w("UPDATE campaigns SET status='sending', next_send_at=? WHERE id=?",
              (now, cid))
@@ -830,6 +869,7 @@ def _purge_junk(camp):
         if keep:
             continue
         db.w("DELETE FROM leads WHERE id=?", (r["id"],))
+        db.w("DELETE FROM lead_events WHERE lead_id=?", (r["id"],))
         purged += 1
         log.info("purge: deleted junk lead %r (%s): %s",
                  r["business_name"], site or "(no website)", reason)

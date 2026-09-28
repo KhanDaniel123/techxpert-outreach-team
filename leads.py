@@ -40,7 +40,7 @@ def import_csv(user_id, campaign_id, file_stream, source="csv"):
                         review_count=(row.get("review_count") or "").strip()):
                     merged += 1
                 continue
-            db.w(
+            lid = db.w(
                 """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
                    website, email, rating, review_count, category, source, notes,
                    personalized_line, fit, created_at)
@@ -54,6 +54,9 @@ def import_csv(user_id, campaign_id, file_stream, source="csv"):
                  (row.get("personalized_line") or "").strip(),
                  lq.detect_fit(name, niche), time.time()))
             imported += 1
+            import crm as _crm
+            _crm.log_event(lid, "lead_created", f"Lead imported from {source}: {name}",
+                           meta={"source": source})
         except Exception as e:
             errors.append(f"row {i}: {e}")
     return imported, merged, errors
@@ -77,7 +80,7 @@ def add_manual(user_id, campaign_id, data):
         return
     camp = db.q("SELECT niche FROM campaigns WHERE id=?", (campaign_id,), one=True)
     niche = (camp["niche"] if camp else "") or ""
-    db.w(
+    lid = db.w(
         """INSERT INTO leads (user_id, campaign_id, business_name, address, phone,
            website, email, rating, review_count, category, source, notes,
            personalized_line, fit, created_at)
@@ -88,6 +91,9 @@ def add_manual(user_id, campaign_id, data):
          data.get("category", ""),
          "manual", data.get("notes", ""), data.get("personalized_line", ""),
          lq.detect_fit(name, niche), time.time()))
+    import crm as _crm
+    _crm.log_event(lid, "lead_created", f"Lead added manually: {name}",
+                   meta={"source": "manual"})
 
 
 SAMPLE_CSV = """business_name,address,phone,website,category,notes,personalized_line

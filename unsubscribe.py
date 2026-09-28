@@ -116,4 +116,7 @@ def mark_unsubscribed(lead_id, user_id):
     if not lead:
         return False
     db.w("UPDATE leads SET unsubscribed=1 WHERE id=?", (lead_id,))
+    import crm as _crm
+    _crm.log_event(lead_id, "unsubscribed",
+                   "Lead unsubscribed via the one-click link; never mailed again")
     return True

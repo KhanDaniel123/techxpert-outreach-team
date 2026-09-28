@@ -232,6 +232,10 @@ def _process_campaign(camp, now_ts, send_fn=None):
             step = item["step"] or 0
             db.w("UPDATE send_queue SET status='failed', last_error=? WHERE id=?",
                  ("Email not validated; skipped.", item["id"]))
+            import crm as _crm
+            _crm.log_event(lead["id"], "sequence_stopped",
+                           f"Sequence stopped: email not validated ({lead.get('email_verdict') or 'unvalidated'}); skipped",
+                           contact_id=contact_id, meta={"step": step})
             outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
                              "to": lead["email"], "step": step,
                              "detail": "Email not validated; skipped."})
@@ -248,6 +252,10 @@ def _process_campaign(camp, now_ts, send_fn=None):
             if not allowed:
                 db.w("UPDATE send_queue SET status='failed', attempts=attempts+1, last_error=? WHERE id=?",
                      (reason[:300], item["id"]))
+                import crm as _crm
+                _crm.log_event(lead["id"], "sequence_stopped",
+                               f"Sequence stopped at step {step}: {reason[:200]}",
+                               contact_id=contact_id, meta={"step": step})
                 outcomes.append({"campaign": camp["name"], "action": "sequence_stopped",
                                  "to": lead["email"], "step": step, "detail": reason})
                 continue

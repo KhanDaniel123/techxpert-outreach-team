@@ -156,6 +156,24 @@ def record_send(user_id, campaign_id, account_id, lead_id, recipient,
          time.time(), status, error, 1 if dry_run else 0))
     if not dry_run and status == "sent" and account_id:
         db.w("UPDATE sender_accounts SET sent_today = sent_today + 1 WHERE id=?", (account_id,))
+    if status in ("sent", "dry-run"):
+        # CRM timeline: every real send and every dry-run is recorded at
+        # the moment it happens, with the mode spelled out.
+        import crm as _crm
+        real = status == "sent" and not dry_run
+        if step and step > 0:
+            what = f"Follow-up {step}"
+            etype = "followup_sent"
+        else:
+            what = "Initial email"
+            etype = "email_sent"
+        _crm.log_event(
+            lead_id, etype,
+            f"{what} {'sent' if real else 'dry-run'} to {recipient}"
+            + ("" if real else " (dry-run: nothing actually left the mailbox)"),
+            contact_id=contact_id,
+            meta={"step": step, "dry_run": not real, "recipient": recipient,
+                  "status": status})
     return lid
 
 
@@ -280,6 +298,14 @@ def mark_replies(user_id, replies):
                 "snippet": snippet,
                 "reply_date": rdate,
             })
+    if newly:
+        import crm as _crm
+        for nr in newly:
+            who = nr["business_name"] or nr["email"] or "lead"
+            _crm.log_event(
+                nr["lead_id"], "reply_detected",
+                f"Reply detected from {who} ({nr['email']}); sequence stopped",
+                meta={"snippet": (nr["snippet"] or "")[:200]})
     return newly
 
 
@@ -416,11 +442,17 @@ def check_account_bounces(user_id, account_id, bounce_addrs=None):
 
     marked = 0
     for row in db.q(
-            "SELECT id, recipient FROM send_log WHERE account_id=? AND status='sent' ORDER BY id DESC LIMIT ?",
+            "SELECT id, recipient, lead_id, contact_id FROM send_log WHERE account_id=? AND status='sent' ORDER BY id DESC LIMIT ?",
             (account_id, BOUNCE_WINDOW * 2)):
         if row["recipient"].lower() in bounce_set:
             db.w("UPDATE send_log SET status='bounced' WHERE id=?", (row["id"],))
             marked += 1
+            import crm as _crm
+            _crm.log_event(
+                row["lead_id"], "bounced",
+                f"Bounced: {row['recipient']}; sequence stopped",
+                contact_id=row["contact_id"],
+                meta={"recipient": row["recipient"]})
 
     recent = db.q(
         "SELECT status FROM send_log WHERE account_id=? AND dry_run=0 ORDER BY id DESC LIMIT ?",
