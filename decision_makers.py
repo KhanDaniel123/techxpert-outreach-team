@@ -280,7 +280,7 @@ def _gemini_grounded_call(prompt):
     key = (config.GEMINI_API_KEY or "").strip()
     if not key:
         raise RuntimeError("no Gemini API key configured")
-    model = (config.GEMINI_MODEL or "gemini-3.8-flash").strip() or "gemini-3.8-flash"
+    model = (config.GEMINI_MODEL or "gemini-2.5-flash").strip() or "gemini-2.5-flash"
     url = ("https://generativelanguage.googleapis.com/v1beta/models/"
            f"{model}:generateContent")
     body = json.dumps({

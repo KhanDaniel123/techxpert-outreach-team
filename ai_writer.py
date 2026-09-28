@@ -100,17 +100,31 @@ def _call_openai(messages):
         url, data=payload,
         headers={"Content-Type": "application/json",
                  "Authorization": f"Bearer {api_key}"})
-    try:
-        with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
-            data = json.loads(resp.read().decode())
-    except urllib.error.HTTPError as e:
+    last_error = None
+    data = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT_S) as resp:
+                data = json.loads(resp.read().decode())
+            break
+        except urllib.error.HTTPError as e:
+            # 429/503 are transient (rate limit / overloaded): retry once
+            # with backoff before giving up, since the pipeline makes
+            # many calls.
+            last_error = e
+            if e.code in (429, 503) and attempt == 0:
+                time.sleep(4)
+                continue
+            break
+        except Exception as e:
+            raise RuntimeError(f"AI request failed: {str(e)[:120]}")
+    if data is None:
+        e = last_error
         try:
             detail = json.loads(e.read().decode()).get("error", {}).get("message", "")
         except Exception:
             detail = ""
         raise RuntimeError(f"AI service error ({e.code}): {detail or 'request failed'}".strip())
-    except Exception as e:
-        raise RuntimeError(f"AI request failed: {str(e)[:120]}")
     try:
         content = data["choices"][0]["message"]["content"]
         parsed = json.loads(content)
