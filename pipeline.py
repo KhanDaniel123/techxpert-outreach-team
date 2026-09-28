@@ -3,7 +3,7 @@
 One campaign mode where the app does everything by itself on scheduler
 ticks. Each tick advances ONE stage for each pipeline-enabled campaign:
 
-    discover -> enrich -> validate -> write -> queue -> done
+    discover -> enrich -> people -> validate -> write -> queue -> done
 
   discover : OpenStreetMap business data first (real, mapped businesses:
              Nominatim geocoding + Overpass POIs, no API key, global),
@@ -22,6 +22,12 @@ ticks. Each tick advances ONE stage for each pipeline-enabled campaign:
   enrich   : visit lead websites and extract publicly listed emails.
              Leads with no public email are marked and skipped, never
              retried, never mailed.
+  people   : decision-maker enrichment (decision_makers.py): ask Gemini with
+             web-search grounding who runs each business, then corroborate
+             every suggestion against the business's own site/imprint or 2+
+             independent sources. Only verified people are stored, with only
+             publicly listed emails attached (never guessed). Skipped
+             gracefully when no Gemini API key is set.
   validate : SMTP/MX-validate found emails. Invalid addresses are dropped
              (email cleared). Only valid/risky addresses move on.
   write    : the Autopilot AI writer drafts one personal email + 3
@@ -56,6 +62,9 @@ OSM_GROUPS_PER_TICK = 3  # Overpass tag groups per tick, sequential, never paral
 WEB_QUERIES_PER_TICK = 2  # web-search queries per tick
 DISCOVER_TIME_BUDGET_S = 25  # stop starting new discovery queries past this
 ENRICH_PER_TICK = 3     # websites crawled for emails per tick
+DM_PER_TICK = 2         # businesses searched for decision makers per tick
+                        # (each does site fetches + one grounded AI call)
+DM_VALIDATE_PER_TICK = 5  # decision-maker emails validated per tick
 VALIDATE_PER_TICK = 10  # emails validated per tick (concurrent probes)
 WRITE_PER_TICK = 3      # AI emails written per tick (slow: site fetch + AI)
 QUEUE_PER_TICK = 25     # queue inserts are cheap DB writes
@@ -63,11 +72,12 @@ TICK_BUDGET_S = 35      # stop advancing campaigns past this per tick
 
 DAILY_DISCOVERY_DEFAULT = 100  # new leads per day per campaign when unset
 
-STAGES = ("discover", "enrich", "validate", "write", "queue", "done")
+STAGES = ("discover", "enrich", "people", "validate", "write", "queue", "done")
 
 STAGE_LABELS = {
     "discover": "Finding leads",
     "enrich": "Finding emails",
+    "people": "Finding decision makers",
     "validate": "Validating emails",
     "write": "Writing AI emails",
     "queue": "Queueing sends",
@@ -613,32 +623,96 @@ def _enrich(camp):
     return None
 
 
+# ---------------- people (decision makers) ----------------
+
+def _dm_enabled(camp):
+    """Per-campaign toggle for decision-maker enrichment (default ON)."""
+    v = camp.get("dm_enabled")
+    return True if v is None else bool(int(v))
+
+
+def _dm_max(camp):
+    """Max decision-maker contacts stored/mailed per business (default 3)."""
+    try:
+        return max(1, min(4, int(camp.get("dm_max_contacts") or 3)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _people(camp):
+    """Find verified decision makers for a few leads. Returns next stage
+    or None. Never fails the pipeline: without a Gemini key every lead is
+    marked pending and retried on later ticks (cheap no-op until the key
+    appears)."""
+    import decision_makers as dmm
+    cid = camp["id"]
+    if not _dm_enabled(camp):
+        return "validate"
+    rows = db.q(
+        "SELECT * FROM leads WHERE campaign_id=? AND website<>'' "
+        "AND COALESCE(dm_status,'') IN ('','pending') "
+        "AND COALESCE(replied,0)=0 AND COALESCE(unsubscribed,0)=0 "
+        "ORDER BY id LIMIT ?",
+        (cid, DM_PER_TICK))
+    if not rows:
+        return "validate"
+    for lead in rows:
+        try:
+            dmm.enrich_lead(lead, camp, max_contacts=_dm_max(camp))
+        except Exception as e:
+            log.warning("people stage: lead %s failed: %s", lead["id"], str(e)[:120])
+            try:
+                db.w("UPDATE leads SET dm_status='pending' WHERE id=?", (lead["id"],))
+            except Exception:
+                pass
+    return None
+
+
 # ---------------- validate ----------------
 
 def _validate(camp):
-    """Validate found emails. Drops invalid ones. Returns next stage or None."""
+    """Validate found emails (lead emails + decision-maker contact emails).
+    Drops invalid ones. Returns next stage or None."""
     from email_validator import validate_emails
     cid = camp["id"]
     rows = db.q(
         "SELECT id, email FROM leads WHERE campaign_id=? AND email<>'' "
         "AND COALESCE(email_verdict,'')='' ORDER BY id LIMIT ?",
         (cid, VALIDATE_PER_TICK))
-    if not rows:
+    crows = db.q(
+        "SELECT c.id, c.email FROM contacts c "
+        "WHERE c.email<>'' AND COALESCE(c.email_verdict,'')='' "
+        "AND c.lead_id IN (SELECT id FROM leads WHERE campaign_id=?) "
+        "ORDER BY c.id LIMIT ?",
+        (cid, DM_VALIDATE_PER_TICK))
+    if not rows and not crows:
         return "write"
-    results = validate_emails([r["email"] for r in rows], max_workers=5)
-    for row, res in zip(rows, results):
+
+    def apply(table, idcol, row, res):
         verdict = res["verdict"]
         detail = res["reason"]
         if res["mx_host"]:
             detail += f" [{res['mx_host']}]"
         if verdict == "invalid":
             # Dropped: email cleared so it can never enter the send queue.
-            db.w("UPDATE leads SET email='', email_verdict='invalid', "
-                 "notes=? WHERE id=?",
-                 (f"pipeline: email dropped ({detail[:150]})", row["id"]))
+            db.w(f"UPDATE {table} SET email='', email_verdict='invalid' WHERE {idcol}=?",
+                 (row["id"],))
+            if table == "leads":
+                db.w("UPDATE leads SET notes=? WHERE id=?",
+                     (f"pipeline: email dropped ({detail[:150]})", row["id"]))
         else:
-            db.w("UPDATE leads SET email_verdict=?, email_verdict_detail=? WHERE id=?",
+            db.w(f"UPDATE {table} SET email_verdict=?, email_verdict_detail=? "
+                 f"WHERE {idcol}=?",
                  (verdict, detail[:200], row["id"]))
+
+    if rows:
+        for row, res in zip(rows, validate_emails([r["email"] for r in rows],
+                                                  max_workers=5)):
+            apply("leads", "id", row, res)
+    if crows:
+        for row, res in zip(crows, validate_emails([r["email"] for r in crows],
+                                                   max_workers=5)):
+            apply("contacts", "id", row, res)
     return None
 
 
@@ -671,7 +745,13 @@ def _write(camp):
 # ---------------- queue ----------------
 
 def _queue(camp):
-    """Queue validated, never-contacted leads into the normal send flow."""
+    """Queue validated, never-contacted leads into the normal send flow.
+
+    When decision-maker enrichment found verified, mailable contacts for a
+    lead, one queue row is inserted PER CONTACT (each contact gets their own
+    step-0 send and their own follow-up chain). Leads without contacts keep
+    the old behavior: one row for the lead's general email."""
+    import decision_makers as dmm
     cid = camp["id"]
     rows = db.q(
         ("SELECT l.* FROM leads l WHERE l.campaign_id=? AND l.selected=1 "
@@ -689,10 +769,15 @@ def _queue(camp):
          "ORDER BY l.id LIMIT ?"),
         (cid, QUEUE_PER_TICK))
     now = time.time()
+    dm_on = _dm_enabled(camp)
+    dm_max = _dm_max(camp)
     for lead in rows:
-        db.w("INSERT INTO send_queue (campaign_id, lead_id, status, scheduled_at, step)"
-             " VALUES (?,?, 'pending', ?, 0)",
-             (cid, lead["id"], now))
+        contacts = (dmm.mailable_contacts(lead["id"], dm_max) if dm_on else [])
+        targets = [c["id"] for c in contacts] or [None]
+        for contact_id in targets:
+            db.w("INSERT INTO send_queue (campaign_id, lead_id, contact_id, status, scheduled_at, step)"
+                 " VALUES (?,?,?, 'pending', ?, 0)",
+                 (cid, lead["id"], contact_id, now))
     if rows:
         db.w("UPDATE campaigns SET status='sending', next_send_at=? WHERE id=?",
              (now, cid))
@@ -759,6 +844,7 @@ def _purge_junk(camp):
 _STAGE_FNS = {
     "discover": _discover,
     "enrich": _enrich,
+    "people": _people,
     "validate": _validate,
     "write": _write,
     "queue": _queue,
@@ -844,7 +930,10 @@ def stats(cid):
         pass
     discovered_today = (int(cur.get("disc_today") or 0)
                         if cur.get("disc_date") == _today_str() else 0)
+    import decision_makers as dmm
+    dm_leads, dm_total = dmm.dm_counts(cid)
     return {"found": found, "emails": emails, "validated": validated,
             "sent": sent, "replies": replies, "queued": queued,
             "discovered_today": discovered_today,
-            "daily_target": _daily_target(camp)}
+            "daily_target": _daily_target(camp),
+            "dm_leads": dm_leads, "dm_total": dm_total}

@@ -10,21 +10,24 @@
 <div><label><small>Location</small></label><input name="location" value="{{ campaign.location }}" placeholder="Phoenix AZ"></div>
 <div><label><small>Target leads</small></label><input type="number" name="pipeline_target_leads" min="5" max="500" value="{{ campaign.pipeline_target_leads or 50 }}"></div>
 <div><label><small>New leads/day</small></label><input type="number" name="daily_discovery_target" min="10" max="1000" value="{{ campaign.daily_discovery_target or 100 }}" title="Discovery pauses each day after this many NEW leads, then resumes tomorrow"></div>
+<div><label><small>Max decision makers/business</small></label><input type="number" name="dm_max_contacts" min="1" max="4" value="{{ campaign.dm_max_contacts or 3 }}" title="How many verified decision makers to find and email per business (1-4)"></div>
+<div style="align-self:end"><label title="Find verified decision makers for each business and email them individually"><input type="checkbox" name="dm_enabled" {{ 'checked' if campaign.dm_enabled is none or campaign.dm_enabled }} style="width:auto"> <small>Decision makers</small></label></div>
 <div style="flex:0;align-self:end"><button class="ghost" type="submit">Save</button></div></div></form>
 <p style="margin-top:10px"><small>
 Stage: <span class="pill {{ 'ok' if pipe_stage=='done' else 'mut' }}">{{ pipe_stage_label }}</span>
 <span class="pill mut">found: {{ pipe.found }}</span>
 <span class="pill mut">today: {{ pipe.discovered_today }}/{{ pipe.daily_target }}</span>
 <span class="pill mut">emails: {{ pipe.emails }}</span>
+<span class="pill mut" title="{{ pipe.dm_total }} verified decision makers found in total">decision makers: {{ pipe.dm_leads }} leads</span>
 <span class="pill mut">validated: {{ pipe.validated }}</span>
 <span class="pill mut">queued: {{ pipe.queued }}</span>
 <span class="pill mut">sent: {{ pipe.sent }}</span>
 <span class="pill ok">replies: {{ pipe.replies }}</span>
 </small></p>
-{% set _order = {'discover':0,'enrich':1,'validate':2,'write':3,'queue':4,'done':5} %}
+{% set _order = {'discover':0,'enrich':1,'people':2,'validate':3,'write':4,'queue':5,'done':6} %}
 {% set _cur = _order.get(pipe_stage, 0) %}
 <div class="pipe-steps" aria-hidden="true">
-{% for _key,_label in [('discover','Finding leads'),('enrich','Finding emails'),('validate','Validating emails'),('write','Writing AI emails'),('queue','Queueing sends'),('done','Done')] %}
+{% for _key,_label in [('discover','Finding leads'),('enrich','Finding emails'),('people','Finding decision makers'),('validate','Validating emails'),('write','Writing AI emails'),('queue','Queueing sends'),('done','Done')] %}
 <span class="pipe-step{{ ' now' if _key==pipe_stage else (' done' if _order[_key]<_cur else '') }}">{{ _label }}</span>
 {% endfor %}
 </div>
@@ -77,12 +80,12 @@ function confirmDeleteLeads() {
 <div><input name="phone" placeholder="Phone"></div>
 <div><input name="personalized_line" placeholder="Personalized line (optional)"></div>
 <div style="flex:0"><button class="ghost" type="submit">Add</button></div></div></form>
-<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Quality</th><th>Fit</th><th>Form?</th><th>Sequence</th>{% if campaign.autopilot %}<th>AI email</th>{% endif %}<th>Notes</th></tr>
+<div class="twrap"><table style="margin-top:10px"><tr><th></th><th>Business</th><th>Phone</th><th>Website</th><th>Email</th><th>Verdict</th><th>Quality</th><th>Fit</th><th>DMs</th><th>Form?</th><th>Sequence</th>{% if campaign.autopilot %}<th>AI email</th>{% endif %}<th>Notes</th></tr>
 {% for l in leads %}<tr>
 <td><form method="post" action="/campaign/{{ campaign.id }}/toggle_lead">
 <input type="hidden" name="lead_id" value="{{ l.id }}">
 <input type="checkbox" name="selected" {{ 'checked' if l.selected }} onchange="this.form.submit()" style="width:auto"></form></td>
-<td>{{ l.business_name }}</td><td class="mono">{{ l.phone }}</td>
+<td><a href="/lead/{{ l.id }}">{{ l.business_name }}</a></td><td class="mono">{{ l.phone }}</td>
 <td>{% if l.website %}<a href="{{ l.website }}" target="_blank">site</a>{% endif %}</td>
 <td class="mono">{{ l.email }}</td>
 <td>{% if l.email_verdict %}<span class="pill {{ 'ok' if l.email_verdict=='valid' else ('bad' if l.email_verdict=='invalid' else 'mut') }}" title="{{ l.email_verdict_detail }}">{{ l.email_verdict }}</span>{% endif %}</td>
@@ -90,11 +93,12 @@ function confirmDeleteLeads() {
 {% if l.website %}<span class="pill ok">Site found</span>{% else %}<span class="pill mut">No site</span>{% endif %}
 {% if l.address %}<span class="pill ok">Address found</span>{% else %}<span class="pill mut">No address</span>{% endif %}</small></td>
 <td>{% if l.fit=='possible_chain' %}<span class="pill bad" title="Chain or franchise signals found. The ICP is independent gyms, so review before contacting.">Possible chain</span>{% elif l.fit=='independent' %}<span class="pill ok" title="No chain or franchise signals found">Independent</span>{% else %}<span class="pill mut">-</span>{% endif %}</td>
+<td>{% if dm_lead_counts.get(l.id) %}<a href="/lead/{{ l.id }}" title="View verified decision makers">{{ dm_lead_counts[l.id] }} found</a>{% else %}<span class="mut">-</span>{% endif %}</td>
 <td>{{ 'yes' if l.has_contact_form else '' }}</td>
 <td><span class="pill {{ seq.get(l.id, ('-', 'mut'))[1] }}">{{ seq.get(l.id, ('-', 'mut'))[0] }}</span></td>
 {% if campaign.autopilot %}<td>{% if l.ai_status == 'ready' %}<span class="pill ok">AI written</span>{% elif l.ai_status == 'pending' %}<span class="pill mut">Writing...</span>{% elif l.ai_status == 'skipped' %}<span class="pill mut" title="{{ l.ai_note }}">Uses template</span>{% elif l.ai_status == 'error' %}<span class="pill bad" title="{{ l.ai_note }}">AI failed</span>{% else %}<span class="pill mut">-</span>{% endif %}</td>{% endif %}
 <td><small>{{ l.notes }}</small>{% if l.personalized_line %}<br><small style="color:#9bd8ff">{{ l.personalized_line }}</small>{% endif %}</td></tr>
-{% else %}<tr><td colspan="{{ 12 if campaign.autopilot else 11 }}"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
+{% else %}<tr><td colspan="{{ 13 if campaign.autopilot else 12 }}"><small>No leads yet. Import a CSV or load the sample.</small></td></tr>{% endfor %}</table></div></div>
 
 <div class="card"><h2>Message template</h2>
 <form method="post" action="/campaign/{{ campaign.id }}/template">

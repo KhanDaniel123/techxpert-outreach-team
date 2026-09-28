@@ -49,6 +49,7 @@ def render_template(tpl, lead, rng=None):
         "email": lead["email"] or "",
         "category": lead["category"] or "",
         "personalized_line": lead.get("personalized_line") or "",
+        "contact_name": lead.get("contact_name") or "",
         "niche": "",
         "location": "",
     }
@@ -146,12 +147,12 @@ def pick_account(user_id, campaign):
 
 
 def record_send(user_id, campaign_id, account_id, lead_id, recipient,
-                subject, status, error="", dry_run=False, step=0):
+                subject, status, error="", dry_run=False, step=0, contact_id=None):
     lid = db.w(
-        """INSERT INTO send_log (user_id, campaign_id, account_id, lead_id, step,
+        """INSERT INTO send_log (user_id, campaign_id, account_id, lead_id, contact_id, step,
            recipient, subject_rendered, sent_at, status, error, dry_run)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-        (user_id, campaign_id, account_id, lead_id, step, recipient, subject,
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (user_id, campaign_id, account_id, lead_id, contact_id, step, recipient, subject,
          time.time(), status, error, 1 if dry_run else 0))
     if not dry_run and status == "sent" and account_id:
         db.w("UPDATE sender_accounts SET sent_today = sent_today + 1 WHERE id=?", (account_id,))
@@ -194,12 +195,14 @@ def _templates_for(campaign, step, lead=None):
     return campaign["subject_tpl"], campaign["body_tpl"]
 
 
-def sequence_gate(user_id, campaign_id, lead, step):
+def sequence_gate(user_id, campaign_id, lead, step, contact_id=None):
     """Decide whether follow-up `step` (>0) may be sent to this lead.
 
     Rules: follow-ups are only enabled when the campaign says so, and a
     follow-up only sends if the previous step sent successfully AND no reply
-    was detected AND the address did not bounce.
+    was detected AND the address did not bounce. When contact_id is given,
+    the previous-step check is per decision-maker contact (each contact
+    runs their own chain); otherwise it is per lead (legacy behavior).
     Returns (allowed: bool, reason: str).
     """
     camp = db.q("SELECT * FROM campaigns WHERE id=?", (campaign_id,), one=True)
@@ -215,8 +218,9 @@ def sequence_gate(user_id, campaign_id, lead, step):
     if bounced:
         return False, "Address bounced; sequence stopped."
     prev = db.q(
-        "SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? AND step=? AND status IN ('sent','dry-run') LIMIT 1",
-        (campaign_id, lead["id"], step - 1), one=True)
+        "SELECT id FROM send_log WHERE campaign_id=? AND lead_id=? "
+        "AND COALESCE(contact_id,0)=COALESCE(?,0) AND step=? AND status IN ('sent','dry-run') LIMIT 1",
+        (campaign_id, lead["id"], contact_id or 0, step - 1), one=True)
     if not prev:
         return False, f"Previous step ({step - 1}) did not send successfully; sequence stopped."
     return True, ""
@@ -248,7 +252,20 @@ def mark_replies(user_id, replies):
         rows = db.q("SELECT id, business_name, email, campaign_id FROM leads "
                     "WHERE user_id=? AND lower(email)=? AND replied=0",
                     (user_id, addr))
-        for row in rows:
+        # A reply from a decision-maker contact's address stops that lead's
+        # whole sequence too (one business = one conversation).
+        crows = db.q("SELECT l.id, l.business_name, c.email, l.campaign_id FROM contacts c "
+                     "JOIN leads l ON l.id=c.lead_id "
+                     "WHERE l.user_id=? AND lower(c.email)=? AND l.replied=0",
+                     (user_id, addr))
+        seen_leads = set()
+        merged = []
+        for row in list(rows) + list(crows):
+            if row["id"] in seen_leads:
+                continue
+            seen_leads.add(row["id"])
+            merged.append(row)
+        for row in merged:
             db.w("UPDATE leads SET replied=1 WHERE id=?", (row["id"],))
             camp = None
             if row["campaign_id"]:
@@ -313,11 +330,15 @@ def notify_replies(user_id, account, new_replies):
     return created
 
 
-def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
+def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0, contact=None):
     """Send (or dry-run) a single message. send_fn(account, to, subject, body)
     defaults to the real Gmail SMTP path. `step` selects the template:
-    0 = main template, 1..10 = follow-up step. Returns dict with outcome details."""
+    0 = main template, 1..10 = follow-up step. `contact` is a verified
+    decision-maker row (or None): the message goes to the contact's public
+    email instead of the lead's general inbox. Returns dict with outcome details."""
     rng = rng or random
+    contact = contact or {}
+    contact_id = contact.get("id")
     account = pick_account(user_id, campaign)
     if not account:
         return {"ok": False, "reason": "no_eligible_account",
@@ -329,9 +350,10 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
                 "detail": f"Follow-up step {step} has no template; sequence ends here."}
 
     tpl_ctx = dict(lead)
+    tpl_ctx["contact_name"] = (contact.get("name") or "").strip()
     subject = render_template(subject_tpl, tpl_ctx, rng)
     body = render_template(body_tpl, tpl_ctx, rng)
-    recipient = (lead["email"] or "").strip()
+    recipient = ((contact.get("email") or "") or (lead["email"] or "")).strip()
     if not recipient:
         return {"ok": False, "reason": "no_email", "detail": "Lead has no email address."}
     if lead.get("unsubscribed"):
@@ -352,7 +374,8 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
 
     if campaign["dry_run"]:
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="dry-run", dry_run=True, step=step)
+                    recipient, subject, status="dry-run", dry_run=True, step=step,
+                    contact_id=contact_id)
         return {"ok": True, "dry_run": True, "account": account["email"],
                 "to": recipient, "subject": subject, "step": step,
                 "intended_delay_s": intended_delay,
@@ -366,13 +389,15 @@ def send_one(user_id, campaign, lead, send_fn=None, rng=None, step=0):
         else:
             send_fn(account, recipient, subject, body)
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="sent", step=step)
+                    recipient, subject, status="sent", step=step,
+                    contact_id=contact_id)
         return {"ok": True, "account": account["email"], "to": recipient,
                 "subject": subject, "step": step, "delay_s": intended_delay}
     except Exception as e:
         err = str(e)[:300]
         record_send(user_id, campaign["id"], account["id"], lead["id"],
-                    recipient, subject, status="failed", error=err, step=step)
+                    recipient, subject, status="failed", error=err, step=step,
+                    contact_id=contact_id)
         return {"ok": False, "reason": "send_failed", "detail": err}
 
 

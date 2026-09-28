@@ -1,0 +1,31 @@
+{% extends "base.html" %}{% block t %}{{ lead.business_name }}{% endblock %}{% block b %}
+<p><a href="/campaign/{{ campaign.id }}">&larr; {{ campaign.name }}</a></p>
+<h1>{{ lead.business_name }}</h1>
+<p><small class="mut">{{ lead.category }}{% if lead.address %} | {{ lead.address }}{% endif %}{% if lead.website %} | <a href="{{ lead.website }}" target="_blank">website</a>{% endif %}{% if lead.phone %} | <span class="mono">{{ lead.phone }}</span>{% endif %}</small></p>
+
+<div class="card"><h2>Decision makers</h2>
+<p><small class="mut">Only verified people are shown. Each person was found by web search and then corroborated against the business's own website/imprint or 2+ independent sources. Suggestions that could not be verified are discarded automatically, never stored. Emails are only ever publicly listed addresses tied to that person; they are never generated or guessed.</small></p>
+{% if contacts %}
+<div class="twrap"><table style="margin-top:10px"><tr><th>Name</th><th>Title</th><th>Email</th><th>Verdict</th><th>Status</th><th>Source</th></tr>
+{% for c in contacts %}<tr>
+<td><b>{{ c.name }}</b></td>
+<td>{{ c.title or '-' }}</td>
+<td class="mono">{{ c.email or '-' }}</td>
+<td>{% if c.email %}<span class="pill {{ 'ok' if c.email_verdict=='valid' else ('bad' if c.email_verdict=='invalid' else 'mut') }}">{{ c.email_verdict or 'unvalidated' }}</span>{% else %}<span class="pill mut" title="No public email found for this person; they are not mailed">no public email</span>{% endif %}</td>
+<td>{% if c.verified %}<span class="pill ok" title="Corroborated: found on the business site/imprint or in 2+ independent sources">Verified</span>{% else %}<span class="pill mut">Unverified</span>{% endif %}</td>
+<td>{% if c.source_url %}<a href="{{ c.source_url }}" target="_blank">source</a>{% else %}-{% endif %}</td>
+</tr>{% endfor %}</table></div>
+{% else %}
+<p><small class="mut">{% if lead.dm_status == 'pending' %}Decision-maker search is pending (waiting for an AI key or a retry).{% elif lead.dm_status == 'skipped' %}No website to search for this lead.{% else %}No verifiable decision makers found yet.{% endif %}</small></p>
+{% endif %}
+</div>
+
+<div class="card"><h2>Lead details</h2>
+<p><small>
+Email: <span class="mono">{{ lead.email or '-' }}</span> {% if lead.email_verdict %}<span class="pill {{ 'ok' if lead.email_verdict=='valid' else ('bad' if lead.email_verdict=='invalid' else 'mut') }}">{{ lead.email_verdict }}</span>{% endif %}<br>
+Fit: {% if lead.fit=='possible_chain' %}<span class="pill bad">Possible chain</span>{% elif lead.fit=='independent' %}<span class="pill ok">Independent</span>{% else %}<span class="pill mut">-</span>{% endif %}<br>
+Replied: {{ 'yes' if lead.replied else 'no' }} | Unsubscribed: {{ 'yes' if lead.unsubscribed else 'no' }}<br>
+Notes: {{ lead.notes or '-' }}
+</small></p>
+</div>
+{% endblock %}

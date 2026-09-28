@@ -119,6 +119,12 @@ campaigns = Table("campaigns", metadata,
                   Column("daily_discovery_target", Integer, nullable=False, server_default="100"),
                   Column("pipeline_stage", Text, default=""),
                   Column("pipeline_cursor", Text, default=""),
+                  # Decision-maker enrichment (decision_makers.py): find real,
+                  # verified people per business and mail them individually.
+                  # dm_enabled=0 skips the "people" pipeline stage entirely;
+                  # dm_max_contacts caps stored+mailed contacts per business.
+                  Column("dm_enabled", Integer, nullable=False, server_default="1"),
+                  Column("dm_max_contacts", Integer, nullable=False, server_default="3"),
                   Column("created_at", Float, nullable=False))
 
 leads = Table("leads", metadata,
@@ -150,12 +156,20 @@ leads = Table("leads", metadata,
               # lead_quality.detect_fit: "possible_chain" when chain/franchise
               # signals are found, "independent" when checked with no signals,
               # "" when not checked yet. The ICP is independent businesses.
+              Column("dm_status", Text, default=""),
+              # decision-maker enrichment state: "" (not attempted),
+              # "pending" (no AI key or transient failure; retried),
+              # "done" (attempted), "skipped" (no website to search).
               Column("created_at", Float, nullable=False))
 
 send_queue = Table("send_queue", metadata,
                    Column("id", Integer, primary_key=True, autoincrement=True),
                    Column("campaign_id", Integer, nullable=False),
                    Column("lead_id", Integer, nullable=False),
+                   # Which verified decision-maker contact this row mails
+                   # (contacts.id). NULL = the lead's own general email
+                   # (the pre-contacts behavior, kept as the fallback).
+                   Column("contact_id", Integer),
                    Column("status", Text, nullable=False, server_default=_sd("'pending'")),
                    Column("scheduled_at", Float, nullable=False, server_default="0"),
                    Column("attempts", Integer, nullable=False, server_default="0"),
@@ -180,6 +194,9 @@ send_log = Table("send_log", metadata,
                  Column("campaign_id", Integer),
                  Column("account_id", Integer),
                  Column("lead_id", Integer),
+                 # The decision-maker contact mailed (contacts.id), if any;
+                 # NULL = the lead's general email.
+                 Column("contact_id", Integer),
                  Column("step", Integer, nullable=False, server_default="0"),
                  # step 0 = initial message, 1..10 = follow-up N
                  Column("recipient", Text, nullable=False),
@@ -219,6 +236,24 @@ ai_content = Table("ai_content", metadata,
                    Column("tokens_in", Integer, nullable=False, server_default="0"),
                    Column("tokens_out", Integer, nullable=False, server_default="0"),
                    Column("created_at", Float, nullable=False))
+# Decision-maker contacts: real people behind each business, found by the
+# decision_makers module (Gemini with web-search grounding, corroborated
+# against the business's own site/imprint). Accuracy rule: only verified
+# people are stored; uncorroborated AI suggestions are discarded.
+# verified=1 means the person was corroborated (site match or 2+
+# independent sources). email is ONLY a publicly listed address tied to
+# that person; '' means none found (never guessed, never mailed).
+contacts = Table("contacts", metadata,
+                 Column("id", Integer, primary_key=True, autoincrement=True),
+                 Column("lead_id", Integer, nullable=False),
+                 Column("name", Text, default=""),
+                 Column("title", Text, default=""),
+                 Column("email", Text, default=""),
+                 Column("email_verdict", Text, default=""),
+                 Column("email_verdict_detail", Text, default=""),
+                 Column("source_url", Text, default=""),
+                 Column("verified", Integer, nullable=False, server_default="0"),
+                 Column("created_at", Float, nullable=False))
 # Reply notifications: one row per replied lead per user. created_at is the
 # detection time; read_at is set when the user opens the notifications page.
 notifications = Table("notifications", metadata,
@@ -271,16 +306,21 @@ def _migrate():
                       "pipeline_target_leads INTEGER DEFAULT 50",
                       "daily_discovery_target INTEGER DEFAULT 100",
                       "pipeline_stage TEXT DEFAULT ''",
-                      "pipeline_cursor TEXT DEFAULT ''"],
-        "send_queue": ["step INTEGER DEFAULT 0"],
-        "send_log": ["step INTEGER DEFAULT 0"],
+                      "pipeline_cursor TEXT DEFAULT ''",
+                      "dm_enabled INTEGER DEFAULT 1",
+                      "dm_max_contacts INTEGER DEFAULT 3"],
+        "send_queue": ["step INTEGER DEFAULT 0",
+                       "contact_id INTEGER"],
+        "send_log": ["step INTEGER DEFAULT 0",
+                     "contact_id INTEGER"],
         "leads": ["replied INTEGER DEFAULT 0",
                   "personalized_line TEXT",
                   "handled INTEGER DEFAULT 0",
                   "ai_status TEXT DEFAULT ''",
                   "ai_note TEXT DEFAULT ''",
                   "unsubscribed INTEGER DEFAULT 0",
-                  "fit TEXT DEFAULT ''"],
+                  "fit TEXT DEFAULT ''",
+                  "dm_status TEXT DEFAULT ''"],
     }
     for table, cols in want.items():
         for ddl in cols:
@@ -289,7 +329,31 @@ def _migrate():
     _ensure_ai_content_table()
     _ensure_user_settings_table()
     _ensure_password_resets_table()
+    _ensure_contacts_table()
     _ensure_app_users_email_unique()
+
+
+def _ensure_contacts_table():
+    """Idempotent CREATE TABLE for decision-maker contacts (covers
+    databases that predate the table; create_all() covers fresh DBs)."""
+    try:
+        from sqlalchemy import text
+        ddl = ("CREATE TABLE IF NOT EXISTS contacts ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+               "lead_id INTEGER NOT NULL, name TEXT DEFAULT '', "
+               "title TEXT DEFAULT '', email TEXT DEFAULT '', "
+               "email_verdict TEXT DEFAULT '', "
+               "email_verdict_detail TEXT DEFAULT '', "
+               "source_url TEXT DEFAULT '', "
+               "verified INTEGER NOT NULL DEFAULT 0, "
+               "created_at FLOAT NOT NULL)")
+        if IS_POSTGRES:
+            ddl = ddl.replace("INTEGER PRIMARY KEY AUTOINCREMENT",
+                              "SERIAL PRIMARY KEY")
+        with engine.begin() as con:
+            con.execute(text(ddl))
+    except Exception:
+        pass
 
 
 def _ensure_notifications_table():

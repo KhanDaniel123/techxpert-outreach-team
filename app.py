@@ -25,6 +25,7 @@ import queue_worker
 import jobs as jobsmod
 import ai_writer as aimod
 import pipeline as pipelinemod
+import decision_makers as decisionmakersmod
 import unsubscribe as unsubmod
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -506,6 +507,7 @@ def campaign(cid):
     ai_cost, ai_written = (aimod.avg_cost_per_lead(cid) if camp.get("autopilot")
                            else (0.0, 0))
     pipe_stats = pipelinemod.stats(cid)
+    dm_lead_counts = decisionmakersmod.lead_dm_counts(cid)
     pipe_stage = (camp.get("pipeline_stage") or "discover").strip() or "discover"
     pipe_stage_label = pipelinemod.STAGE_LABELS.get(pipe_stage, pipe_stage)
     return render_template("campaign.html", campaign=camp, leads=lead_rows,
@@ -515,7 +517,25 @@ def campaign(cid):
                            ai_on=ai_on, ai_cost=ai_cost, ai_written=ai_written,
                            pipe=pipe_stats, pipe_stage=pipe_stage,
                            pipe_stage_label=pipe_stage_label,
+                           dm_lead_counts=dm_lead_counts,
                            user=current_user())
+
+
+@app.route("/lead/<int:lid>")
+def lead_detail(lid):
+    r = require_login()
+    if r:
+        return r
+    lead = db.q("SELECT * FROM leads WHERE id=?", (lid,), one=True)
+    if not lead:
+        return "Lead not found", 404
+    camp = db.q("SELECT * FROM campaigns WHERE id=? AND user_id=?",
+                (lead["campaign_id"], uid()), one=True)
+    if not camp:
+        return "Lead not found", 404
+    contacts = decisionmakersmod.get_contacts(lid)
+    return render_template("lead.html", lead=lead, campaign=camp,
+                           contacts=contacts, user=current_user())
 
 
 def _lead_seq_status(cid, fu_count):
@@ -708,11 +728,19 @@ def campaign_pipeline_save(cid):
     except ValueError:
         daily = 100
     daily = max(10, min(1000, daily))
+    try:
+        dm_max = int(request.form.get("dm_max_contacts", 3) or 3)
+    except ValueError:
+        dm_max = 3
+    dm_max = max(1, min(4, dm_max))
     db.w("UPDATE campaigns SET niche=?, location=?, pipeline_target_leads=?, "
-         "daily_discovery_target=? WHERE id=? AND user_id=?",
+         "daily_discovery_target=?, dm_enabled=?, dm_max_contacts=? "
+         "WHERE id=? AND user_id=?",
          (request.form.get("niche", "").strip()[:120],
           request.form.get("location", "").strip()[:120],
-          target, daily, cid, uid()))
+          target, daily,
+          1 if request.form.get("dm_enabled") else 0, dm_max,
+          cid, uid()))
     return redirect(url_for("campaign", cid=cid))
 
 
