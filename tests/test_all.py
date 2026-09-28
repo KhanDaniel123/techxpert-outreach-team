@@ -1309,7 +1309,7 @@ finally:
     configmod.GEMINI_API_KEY = _old_gemini
 
 check("gemini model default is flash, env-overridable",
-      configmod.GEMINI_MODEL == "gemini-2.0-flash")
+      configmod.GEMINI_MODEL == "gemini-3.8-flash")
 
 # ================= 12. Discovery filter (aggregators/listicles/junk) =================
 NICHE = "Gyms and fitness centers"

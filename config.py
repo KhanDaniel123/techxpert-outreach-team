@@ -47,11 +47,12 @@ AI_MODEL = "gpt-4o-mini"
 AI_PRICE_IN_PER_M = 0.15   # USD per million input tokens (approx)
 AI_PRICE_OUT_PER_M = 0.60  # USD per million output tokens (approx)
 
-# Gemini model, env-overridable. gemini-2.0-flash is cheap and fast and
+# Gemini model, env-overridable. gemini-3.8-flash is Google's current stable
+# Flash model (gemini-2.0-flash was retired 2026-06-01 and 404s) and
 # speaks the OpenAI-compatible chat-completions dialect below. Gemini's
 # free tier covers this app's volume, so cost is reported as zero.
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash").strip() \
-    or "gemini-2.0-flash"
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash").strip() \
+    or "gemini-3.8-flash"
 
 # Optional system sender for password-reset emails: a Gmail address + App
 # Password used when the resetting user has no connected sender account of
