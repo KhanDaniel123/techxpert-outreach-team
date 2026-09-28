@@ -585,10 +585,35 @@ check("preview renders", j["subject"].startswith("Hey ") and j["body"][:2] == "Y
 
 # email validator fast paths
 from email_validator import validate_email
+import email_validator as evmod
 v = validate_email("not-an-email")
 check("validator rejects bad syntax fast", v["verdict"] == "invalid" and not v.get("mx_checked"))
 v = validate_email("someone@mailinator.com")
 check("validator flags disposable", v["verdict"] == "invalid" and "isposable" in v["reason"])
+
+# validator on a server where outbound SMTP is blocked (e.g. Vercel port 25):
+# no MX host ever answers -> "risky" (MX exists, mailbox unverified), not "unknown"
+class _RefusedSMTP:
+    def __init__(self, *a, **k): pass
+    def connect(self, host, port): raise OSError("Connection refused")
+with mock.patch.object(evmod, "mx_hosts", return_value=[(10, "mx.example.com")]), \
+     mock.patch("smtplib.SMTP", _RefusedSMTP):
+    v = validate_email("info@example.com", timeout=5)
+check("validator marks SMTP-unreachable as risky (queueable)",
+      v["verdict"] == "risky" and "MX" in v["reason"])
+
+# a real 550 rejection is still a real signal -> invalid
+class _RejectSMTP:
+    def __init__(self, *a, **k): pass
+    def connect(self, host, port): return (220, b"ok")
+    def ehlo_or_helo_if_needed(self): pass
+    def mail(self, frm): return (250, b"ok")
+    def rcpt(self, rcpt): return (550, b"no such mailbox")
+    def quit(self): pass
+with mock.patch.object(evmod, "mx_hosts", return_value=[(10, "mx.example.com")]), \
+     mock.patch("smtplib.SMTP", _RejectSMTP):
+    v = validate_email("nope@example.com", timeout=5)
+check("validator still marks real 550 rejection invalid", v["verdict"] == "invalid")
 
 # chunked jobs (mocked network)
 with mock.patch("jobs._validate_one_email", return_value={"verdict": "valid", "detail": "mocked"}):
@@ -1297,6 +1322,38 @@ check("process_pipeline_full reports diagnostics",
       res3["rounds"] >= 1 and isinstance(diag.get("leads"), int)
       and isinstance(diag.get("verdicts"), dict)
       and isinstance(diag.get("queueable_now"), int))
+
+# --- legacy "unknown / probe blocked" rows get re-validated, not stuck ---
+cid_rv = make_campaign(c1, "RevalCamp")
+lid_rv = add_lead(cid_rv, u1["id"], "reval@example.com", "Reval Biz", verdict="")
+db.w("UPDATE leads SET email_verdict='unknown', "
+     "email_verdict_detail='probe blocked/failed: Connection refused' WHERE id=?",
+     (lid_rv,))
+db.w("UPDATE campaigns SET pipeline_enabled=1, pipeline_stage='validate' WHERE id=?",
+     (cid_rv,))
+camp_rv = db.q("SELECT * FROM campaigns WHERE id=?", (cid_rv,), one=True)
+with mock.patch.object(evmod, "mx_hosts", return_value=[(10, "mx.example.com")]), \
+     mock.patch("smtplib.SMTP", _RefusedSMTP):
+    nxt_rv = pipelinemod._validate(camp_rv)
+    # second tick: nothing left to validate -> advances to write
+    nxt_rv2 = pipelinemod._validate(camp_rv)
+check("_validate re-validates probe-blocked unknown rows as risky",
+      db.q("SELECT email_verdict FROM leads WHERE id=?", (lid_rv,), one=True)["email_verdict"] == "risky"
+      and nxt_rv is None and nxt_rv2 == "write")
+
+# --- a "done" campaign with legacy unknowns goes back to validate ---
+import json as _jsonmod
+db.w("UPDATE campaigns SET pipeline_stage='done', pipeline_cursor=? WHERE id=?",
+     (_jsonmod.dumps({"disc_date": pipelinemod._today_str()}), cid_rv))
+db.w("UPDATE leads SET email_verdict='unknown', "
+     "email_verdict_detail='probe blocked/failed: Connection refused' WHERE id=?",
+     (lid_rv,))
+camp_rv = db.q("SELECT * FROM campaigns WHERE id=?", (cid_rv,), one=True)
+with mock.patch.object(evmod, "mx_hosts", return_value=[(10, "mx.example.com")]), \
+     mock.patch("smtplib.SMTP", _RefusedSMTP):
+    stage_rv, _note_rv = pipelinemod.tick_campaign(camp_rv)
+check("done campaign with legacy unknowns returns to validate", stage_rv == "validate")
+db.w("UPDATE campaigns SET pipeline_enabled=0 WHERE id=?", (cid_rv,))
 
 # no residual Google OAuth references
 import subprocess

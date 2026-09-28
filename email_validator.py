@@ -198,6 +198,7 @@ def validate_email(email, mail_from=None, timeout=CONNECT_TIMEOUT,
     probe_local = f"catchtest-{secrets.token_hex(6)}"
 
     last_error = ""
+    got_response = False  # True once any MX host answers SMTP (any code)
     for _, mx_host in hosts:
         if time.time() > deadline:
             break
@@ -205,6 +206,7 @@ def validate_email(email, mail_from=None, timeout=CONNECT_TIMEOUT,
             # 4a. catch-all detection: probe a random nonexistent address first
             stage, code, msg = _smtp_probe(mx_host, mail_from, f"{probe_local}@{domain}",
                                           timeout, deadline)
+            got_response = True
             if stage == "mailfrom":
                 last_error = f"MAIL FROM rejected ({code})"
                 break  # our probe identity is rejected; other hosts will do the same
@@ -218,6 +220,7 @@ def validate_email(email, mail_from=None, timeout=CONNECT_TIMEOUT,
 
             # 4b. real probe
             stage, code, msg = _smtp_probe(mx_host, mail_from, email, timeout, deadline)
+            got_response = True
             result["mx_host"] = mx_host
             if stage == "mailfrom":
                 last_error = f"MAIL FROM rejected ({code})"
@@ -236,6 +239,14 @@ def validate_email(email, mail_from=None, timeout=CONNECT_TIMEOUT,
             continue
 
     # exhausted hosts / budget
+    if not got_response:
+        # No MX host ever answered SMTP (e.g. outbound port 25 is blocked on
+        # this server, as on Vercel). That is evidence about OUR network, not
+        # the mailbox: MX exists, so the address stays queueable-but-unverified
+        # ("risky"), exactly like a catch-all server.
+        return finish("risky",
+                      "mailbox unverifiable from this server: no SMTP response "
+                      "from any MX host (outbound SMTP may be blocked here); MX exists")
     if "greylist" in last_error.lower() or "deferred" in last_error.lower():
         return finish("unknown", f"probe deferred: {last_error} (retry later)")
     if last_error:

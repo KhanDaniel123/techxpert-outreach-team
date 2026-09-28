@@ -695,18 +695,39 @@ def _people(camp):
 
 # ---------------- validate ----------------
 
+# Rows needing (re-)validation: never validated, plus rows stuck at "unknown"
+# by the old blocked-probe behavior (no SMTP response from any MX host, e.g.
+# port 25 blocked on the server). The validator now marks those "risky".
+_NEED_REVAL = ("(COALESCE(email_verdict,'')='' "
+               "OR (email_verdict='unknown' "
+               "AND email_verdict_detail LIKE 'probe blocked/%'))")
+
+
+def _needs_revalidation(cid):
+    """True if any lead email still needs (re-)validation."""
+    return db.q(
+        "SELECT COUNT(*) c FROM leads WHERE campaign_id=? AND email<>'' "
+        f"AND {_NEED_REVAL}",
+        (cid,), one=True)["c"] > 0
+
+
 def _validate(camp):
     """Validate found emails (lead emails + decision-maker contact emails).
     Drops invalid ones. Returns next stage or None."""
     from email_validator import validate_emails
     cid = camp["id"]
+    # Re-validate rows never validated, plus rows stuck at unknown by the old
+    # blocked-probe behavior (no SMTP response from any MX host, e.g. port 25
+    # blocked on the server): the validator now marks those "risky".
+    _need_reval = _NEED_REVAL
     rows = db.q(
         "SELECT id, email FROM leads WHERE campaign_id=? AND email<>'' "
-        "AND COALESCE(email_verdict,'')='' ORDER BY id LIMIT ?",
+        f"AND {_need_reval} ORDER BY id LIMIT ?",
         (cid, VALIDATE_PER_TICK))
     crows = db.q(
         "SELECT c.id, c.email, c.lead_id FROM contacts c "
-        "WHERE c.email<>'' AND COALESCE(c.email_verdict,'')='' "
+        "WHERE c.email<>'' "
+        f"AND {_need_reval.replace('email_verdict', 'c.email_verdict')} "
         "AND c.lead_id IN (SELECT id FROM leads WHERE campaign_id=?) "
         "ORDER BY c.id LIMIT ?",
         (cid, DM_VALIDATE_PER_TICK))
@@ -897,11 +918,15 @@ def tick_campaign(camp):
         # Daily growth loop: at the start of a new day a finished pipeline
         # goes back to discover so fresh leads keep flowing in. Same day:
         # stays done (sending, follow-ups, reply scans continue via the
-        # normal flow).
+        # normal flow) -- unless legacy "unknown" rows still need the
+        # (re-)validation the old blocked-probe behavior denied them.
         cur = _cursor(camp)
         if cur.get("disc_date") != _today_str():
             _set_stage(camp["id"], "discover")
             stage = "discover"
+        elif _needs_revalidation(camp["id"]):
+            _set_stage(camp["id"], "validate")
+            stage = "validate"
         else:
             return "done", ""  # terminal for today
     if stage not in _STAGE_FNS:
